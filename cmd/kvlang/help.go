@@ -8,31 +8,27 @@ import (
 const helpText = `kvlang — KV language VM interpreter
 
 usage:
-  kvlang layout <file|dir>…                   装载到 /lib/（多文件拼接为单源，不执行）
-  kvlang layoutrwirandrun <file|dir>… [--debug]   先 layout 再 run
-  kvlang run [{lib}.{func}]                 执行 /lib/{lib}.{func}（默认 .init，无参=匿名 lib）
-  kvlang -c "code" [--debug]               内联执行
-  echo "code" | kvlang                      管道执行（stdin 非终端）
+  kvlang [--kvspace <dsn>] <file|dir>…      装载并执行
+  kvlang layoutandrun <file|dir>…           装载并执行（显式子命令）
+  kvlang -c "code"                          执行内联代码
+  echo "code" | kvlang                      执行管道代码（stdin 非终端）
 
   kvlang vet [--dump] [--lower] [-c code | <file.kv>]  语法检查
   kvlang format [-w] [-c code | <file.kv>]  格式化（别名 fmt；默认打印，-w 原地写回）
-  kvlang ps [--kvspace <dsn>]              列出所有 vthread（如 Linux ps）
   kvlang help                                显示此帮助
 
-KV 空间操作已迁至独立 CLI（kvlang-go 仓 cmd/kvspace）:
-  kvspace [--kvspace dsn] <get|mget|set|del|list|tree|dump|watch|notify|clear>
-
 选项:
-  --kvspace <dsn>                kvspace 地址（默认 redis://127.0.0.1:6379；KVLANG_KVSPACE 可覆盖）
-  --debug                        单步调试模式（设 .debugger="step"，agent 通过 kvspace 协议控制）
+  --kvspace <dsn>                kvspace 地址（默认 art://local；KVLANG_KVSPACE 可覆盖）
+
+说明:
+  默认 ART 存储仅在当前进程内有效且不持久化；不同 kvlang/kvspace 进程不共享状态。
+  需要装载后执行时，请在同一次调用中传入文件，或使用 layoutandrun。
 
 示例:
-  kvlang layoutrwirandrun file.kv             装载并执行
-  kvlang layout lib.kv                    仅装载不执行
-  kvlang run math.sum                   执行 /lib/math.sum
+  kvlang file.kv                           装载并执行
+  kvlang layoutandrun lib.kv main.kv       多文件装载并执行
   kvlang -c 'x = 40 + 2; print(x)'      内联执行（= 等价于 <-）
   kvlang vet -c 'a = { k=1 }'           语法检查内联代码
-  kvspace dump /lib                      查看已加载函数
 `
 
 func showHelp() {

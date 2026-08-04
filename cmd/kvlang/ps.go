@@ -7,10 +7,11 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 
+	"github.com/array2d/kvspace-go"
 	"kvlang/keytree"
 	"kvlang/vthread"
-	"github.com/array2d/kvspace-go"
 )
 
 func cmdPS(args []string) {
@@ -18,17 +19,19 @@ func cmdPS(args []string) {
 	dsn := fs.String("kvspace", defaultKVSpace(), kvspaceFlagDesc)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: kvlang ps [--kvspace <dsn>]")
-		fmt.Fprintln(os.Stderr, "  list all vthreads like Linux ps")
+		fmt.Fprintln(os.Stderr, "  ART 仅能列出当前进程的 vthread；独立 CLI 进程通常为空")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
 
 	kv := kvspace.Conn(*dsn)
+	defer kv.DisConn()
 
-	vtids := kv.List(keytree.VthreadRoot + keytree.PathSegSep, false)
+	vtids := kv.List(keytree.VthreadRoot+keytree.PathSegSep, false)
 
 	var ids []int64
 	for _, v := range vtids {
+		v = strings.TrimSuffix(v, keytree.PathSegSep)
 		if id, e := strconv.ParseInt(v, 10, 64); e == nil {
 			ids = append(ids, id)
 		}

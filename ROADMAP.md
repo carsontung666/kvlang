@@ -12,12 +12,10 @@
 - [x] multi-return values + discard (`_`)
 - [x] vthread coroutine model with concurrent workers
 - [x] soft links (path redirection)
-- [x] serve daemon with Redis persistence
 - [x] pipe / inline (`-c`) / file execution modes
-- [x] `kvspace` CLI: get, set, del, list, tree, clear, watch, notify
 - [x] `vet` (syntax check) + `format` (source formatter)
 - [x] 87 tutorial examples: basics, functions, control flow, algorithms, LeetCode
-- [x] CI: build (Linux + macOS), tutorial tests (Redis), cross-compile releases
+- [x] CI: build (Linux + macOS), tutorial tests, cross-compile releases
 
 ## v0.2.0 — Tensor & Distributed
 
@@ -31,7 +29,7 @@
 - [ ] multi-node vthread scheduling
 - [ ] kvspace sharding
 - [ ] RDMA backend for kvspace
-- [ ] cluster mode (`kvlang serve --cluster`)
+- [ ] cluster mode
 
 ## Future
 

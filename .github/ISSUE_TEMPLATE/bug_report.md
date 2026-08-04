@@ -27,5 +27,4 @@ What happens instead (error message, wrong output, crash).
 ### Environment
 - OS: [e.g. Ubuntu 24.04]
 - Go version: [e.g. 1.24.4]
-- Redis version: [e.g. 7.2]
 - kvlang commit: [e.g. v0.1.0]

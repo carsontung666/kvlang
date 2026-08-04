@@ -15,7 +15,14 @@
 问题从 tutorial/questions/*.question 加载，答案在同名 .answer 中；结果保存于 /tmp/agent_eval/。
 """
 from __future__ import annotations
-import json, os, re, subprocess, sys, urllib.request, uuid
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -97,7 +104,6 @@ def strip_fences(code: str) -> str:
 
 
 def run_kv(path: Path) -> tuple[str, str]:
-    subprocess.run(["kvspace", "clear"], capture_output=True, timeout=10)
     r = subprocess.run([KV, str(path)], capture_output=True, text=True, timeout=60, cwd=str(ROOT))
     return r.stdout, r.stderr
 
@@ -184,7 +190,7 @@ def main() -> None:
                 lines.append(f"Q: {task}")
                 lines.append(f"期望: {' | '.join(expect) if expect else '(无)'}")
                 lines.append(f"回答: {response}")
-                lines.append(f"评分: __/100")
+                lines.append("评分: __/100")
                 lines.append("")
             review_file.write_text("\n".join(lines))
             print(f"DEEP-DIVE   : 待 Claude 评分（见 {review_file}）")

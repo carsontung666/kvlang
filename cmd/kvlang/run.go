@@ -22,9 +22,10 @@ func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	dsn   := fs.String("kvspace", defaultKVSpace(), kvspaceFlagDesc)
 	code  := fs.String("c", "", "内联代码（直接执行字符串）")
-	debug := fs.Bool("debug", false, "单步调试模式（交互式，每条指令暂停）")
+	debug := fs.Bool("debug", false, "单步调试模式（仅供 ART 同进程控制器使用）")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: kvlang run [--debug] [-c code | {lib}.{func} | <file.kv|dir>]")
+		fmt.Fprintln(os.Stderr, "  ART 不跨进程共享：独立执行 {lib}.{func} 需由同一进程预先装载；--debug 不能由外部 CLI 控制")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -34,27 +35,35 @@ func cmdRun(args []string) {
 		runCode("inline", strings.NewReader(*code), *dsn, *debug)
 	case fs.NArg() > 0:
 		arg := fs.Arg(0)
-		if !strings.HasSuffix(arg, ".kv") && strings.Contains(arg, keytree.MemberSep) {
-			parts := strings.SplitN(arg, keytree.MemberSep, 2)
-			runLib(parts[0], parts[1], *debug)
-		} else if !strings.HasSuffix(arg, ".kv") {
-			runLib(arg, "init", *debug)
-		} else {
+		if isKVSourcePath(arg) {
 			runFiles(*dsn, fs.Args(), *debug)
+		} else if strings.Contains(arg, keytree.MemberSep) {
+			parts := strings.SplitN(arg, keytree.MemberSep, 2)
+			runLib(*dsn, parts[0], parts[1], *debug)
+		} else {
+			runLib(*dsn, arg, "init", *debug)
 		}
 	case !isTerminal():
 		runCode("stdin", os.Stdin, *dsn, *debug)
 	default:
-		runLib("", "init", false)
+		runLib(*dsn, "", "init", false)
 	}
 }
 
+func isKVSourcePath(path string) bool {
+	if strings.HasSuffix(path, ".kv") {
+		return true
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 // runLib 执行 /lib/{lib}.{func}。lib/func 为空时默认 "init"。
-func runLib(lib, fn string, debug bool) {
+func runLib(dsn, lib, fn string, debug bool) {
 	if fn == "" { fn = "init" }
 	name := lib + keytree.MemberSep + fn
 	if lib == "" { name = fn }
-	kv := kvspace.Conn(defaultKVSpace())
+	kv := kvspace.Conn(dsn)
 	defer kv.DisConn()
 	registerDefaultTerm(kv)
 	executeEntry(kv, name, debug)

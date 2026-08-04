@@ -1,0 +1,7 @@
+file,kvlang_ms,python_ms,c_ms
+tutorial/01-basics/arith.kv,17.921,24.449,4.783
+tutorial/01-basics/hello.kv,6.549,24.338,4.145
+tutorial/04-algo/factorial.kv,34.510,24.853,4.810
+tutorial/04-algo/fibonacci.kv,42.732,24.402,4.500
+tutorial/04-algo/gcd.kv,36.506,24.433,5.147
+tutorial/04-algo/prime_sieve.kv,668.064,24.449,4.698

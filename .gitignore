@@ -42,14 +42,10 @@ build/
 .DS_Store
 Thumbs.db
 
-# ── Redis runtime artifacts ──────────────────────────
-dump.rdb
-appendonly.aof
-
 # ── Project-specific ─────────────────────────────────
 /tmp/
 /post/
-kvlang
+/kvlang
 
 # Tool config
 .omc/

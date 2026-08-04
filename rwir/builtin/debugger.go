@@ -15,7 +15,7 @@ func init() {
 }
 
 // debuggerOp: debugger() —— 内联暂停点（tothink-031，对齐 V8/TypeScript `debugger;` 语句）。
-// 非调试模式下（.debugger 为空）为 no-op；调试模式下暂停当前 vthread 等待 agent 命令。
+// 非调试模式下（.debugger 为空）为 no-op；调试模式下暂停当前 vthread 等待同进程控制器命令。
 // 暂停/恢复逻辑内联于此（不 import kvcpu 以避免循环依赖：kvcpu → builtin）。
 type debuggerOp struct{}
 func (debuggerOp) Call(f *rwir.Frame) error {
@@ -34,7 +34,7 @@ func (debuggerOp) Call(f *rwir.Frame) error {
 	})
 	f.KV.Notify(pauseKey, kvspace.NewBytes(info))
 
-	// 阻塞等待 agent 命令
+	// 阻塞等待同进程控制器命令
 	resumeKey := keytree.VThreadDebuggerResume(f.Vtid)
 	for {
 		cmdVal := f.KV.Watch(resumeKey, 0)

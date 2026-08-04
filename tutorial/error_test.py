@@ -5,7 +5,9 @@
 用法: python3 tutorial/error_test.py
 """
 from __future__ import annotations
-import re, subprocess, sys
+
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,8 +46,6 @@ def _unescape_logx(stderr: str) -> str:
 
 def collect_errors(rel: str) -> str:
     """运行 .kv 文件（-c 行优先）或 vet，收集 stderr（含各级诊断）。"""
-    # 用 kvspace clear 隔离各 case
-    subprocess.run(["kvspace", "clear"], capture_output=True, timeout=10)
     # 先尝试直接运行（运行时错误放 stderr + logx）
     r = subprocess.run([KV, rel], capture_output=True, text=True,
                        timeout=60, cwd=str(ROOT))

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"kvlang/ast"
@@ -15,18 +18,33 @@ import (
 
 // cmdLayoutAndRun 先 layout 再 run（fix-039：替代旧 run 机制）。
 func cmdLayoutAndRun(args []string) {
-	if len(args) == 0 {
-		runLib("", "init", false)
+	fs := flag.NewFlagSet("layoutandrun", flag.ExitOnError)
+	dsn := fs.String("kvspace", defaultKVSpace(), kvspaceFlagDesc)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: kvlang layoutandrun [--kvspace dsn] <file.kv|dir>...")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		runLib(*dsn, "", "init", false)
 		return
 	}
-	cmdLayout(args)
-	entry := findEntry(defaultKVSpace())
-	runLib("", entry, false)
+
+	kv := kvspace.Conn(*dsn)
+	defer kv.DisConn()
+	registerDefaultTerm(kv)
+	layoutFiles(kv, fs.Args())
+	executeEntry(kv, findEntryKV(kv), false)
 }
 
 func findEntry(dsn string) string {
 	kv := kvspace.Conn(dsn)
 	defer kv.DisConn()
+	return findEntryKV(kv)
+}
+
+func findEntryKV(kv kvspace.KVSpace) string {
 	if entry := findEntryPrefix(kv, keytree.LibRoot+"/"); entry != "" {
 		return entry
 	}
@@ -60,7 +78,7 @@ func runFiles(dsn string, paths []string, debug bool) {
 	if len(files) == 0 { logx.Fatal("no .kv files found") }
 
 	if !loadFunctions(kv, files) { return }
-	executeEntry(kv, findEntry(dsn), debug)
+	executeEntry(kv, findEntryKV(kv), debug)
 }
 
 func runCode(name string, rc io.Reader, dsn string, debug bool) {
@@ -84,5 +102,5 @@ func runCode(name string, rc io.Reader, dsn string, debug bool) {
 		initFn := ast.Func{Sig: ast.FuncSig{Name: "init"}, Body: body}
 		layout.WriteFunc(kv, "", lower.Func(&initFn))
 	}
-	executeEntry(kv, findEntry(dsn), debug)
+	executeEntry(kv, findEntryKV(kv), debug)
 }

@@ -14,9 +14,10 @@ package main
 import (
 	"os"
 
-	// 注册 KVSpace 实现；--kvspace DSN 的 scheme 选择后端（默认 redis://；可 KVLANG_KVSPACE=art:// 切换进程内 ART）。
-	_ "github.com/array2d/kvspace-go/redis"
+	// 注册进程内 ART 后端。
 	_ "github.com/array2d/kvspace-go/art"
+	// 注册四种共享内存后端；非 Linux 或禁用 cgo 时会给出明确错误。
+	_ "kvlang/internal/kvshm"
 )
 
 func main() {

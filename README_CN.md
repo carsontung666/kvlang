@@ -18,7 +18,7 @@
 ```
 PC   = "/vthread/tid/[0,0]/.fn/[1,0]"    程序计数器是 KV 路径
 指令 = kv.Get(PC)                         取指是一次 KV 读
-调用 = 创建子树；返回 = 清理子树           崩溃后按 PC 重启继续
+调用 = 创建子树；返回 = 清理子树           状态仅存于当前进程
 ```
 
 每条指令占据二维坐标 `[s0, s1]`：`[s0,0]` 恒为操作码，`[s0,-j]` 读参，`[s0,+j]` 写参。
@@ -39,7 +39,7 @@ def add(A: int, B: int) -> (C: int) { A + B -> C }
 ## Quick Start
 
 ```bash
-# 依赖: Go 1.24+, Redis
+# 依赖：Go 1.24+；存储默认使用进程内 ART
 make build
 
 ./kvlang tutorial/01-basics/hello.kv         # 运行文件
@@ -48,6 +48,8 @@ echo '40 + 2 -> x; print(x)' | ./kvlang      # pipe 模式（; 分隔同行语�
 ./kvlang vet my.kv                           # 语法检查
 ./kvlang format my.kv                        # 格式化
 ```
+
+默认 ART 存储仅在当前进程内有效且不持久化。请在同一次调用中完成装载和执行；分开的 `layout`、`run`、`ps` 或 `kvspace` 进程不会共享状态。
 
 ---
 

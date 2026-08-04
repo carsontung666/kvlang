@@ -18,7 +18,7 @@
 ```
 PC    = "/vthread/tid/[0,0]/.fn/[1,0]"    the program counter is a KV path
 fetch = kv.Get(PC)                         instruction fetch is one KV read
-call  = create subtree; return = clean it  crash? restart and resume from PC
+call  = create subtree; return = clean it  state lives for this process
 ```
 
 Every instruction occupies a 2-D coordinate `[s0, s1]`: `[s0,0]` is always the opcode, `[s0,-j]` read params, `[s0,+j]` write params.
@@ -39,7 +39,7 @@ Four address-space domains: `/lib` (function library) `/vthread` (runtime frames
 ## Quick Start
 
 ```bash
-# Requirements: Go 1.24+, Redis
+# Requirement: Go 1.24+; storage uses in-process ART by default
 make build
 
 ./kvlang tutorial/01-basics/hello.kv         # run a file
@@ -48,6 +48,8 @@ echo '40 + 2 -> x; print(x)' | ./kvlang      # pipe mode (; separates statements
 ./kvlang vet my.kv                           # syntax check
 ./kvlang format my.kv                        # format
 ```
+
+The default ART store is process-local and non-persistent. Load and execute in one invocation; separate `layout`, `run`, `ps`, or `kvspace` processes do not share state.
 
 ---
 

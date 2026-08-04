@@ -21,6 +21,7 @@ func cmdLayout(args []string) {
 	dsn := fs.String("kvspace", defaultKVSpace(), kvspaceFlagDesc)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: kvlang layout [--kvspace dsn] <file.kv|dir>...")
+		fmt.Fprintln(os.Stderr, "  ART 数据不跨进程保留；需要随后执行时请改用 layoutandrun")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -32,10 +33,14 @@ func cmdLayout(args []string) {
 
 	kv := kvspace.Conn(*dsn)
 	defer kv.DisConn()
+	layoutFiles(kv, fs.Args())
+}
+
+func layoutFiles(kv kvspace.KVSpace, paths []string) {
 	initDirs(kv)
 
 	var allFiles []string
-	for _, arg := range fs.Args() {
+	for _, arg := range paths {
 		f, err := collectKVFiles(arg)
 		if err != nil { logx.Fatal("collect .kv files: %v", err) }
 		allFiles = append(allFiles, f...)

@@ -22,7 +22,7 @@ type Rwir struct {
 }
 
 // maxParams 单条指令最大读写槽数。对齐五语言参数上限：C 标准保证≥127，取 2^7=128。
-// Decode 的 MGET key 数 = 1 + 2*maxParams = 257，Redis 单次批量完全可承受。
+// Decode 的批量读取 key 数 = 1 + 2*maxParams = 257。
 // 超过 128 槽的指令极少见（函数参数的极端情形），超出时 Decode 返回错误而非静默截断。
 const maxParams = 128
 

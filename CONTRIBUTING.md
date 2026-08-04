@@ -10,15 +10,15 @@ cd kvlang
 make build
 ```
 
-**Prerequisites**: Go 1.24+, Redis (for integration tests).
+**Prerequisites**: Go 1.24+ and Python 3 (for tutorial tests).
 
 ## Development workflow
 
 ```bash
 # After making changes:
 make vet          # static analysis
-make test         # unit tests
-python3 run.py             # integration tests (requires Redis)
+go test ./...     # unit tests
+python3 tutorial/test.py   # tutorial tests
 ```
 
 ## Project structure
@@ -31,7 +31,6 @@ internal/
   layoutrwir/       AST → KV path tree (opcodes at /vthread/*)
   vthread/          virtual thread lifecycle
   kvcpu/            128-worker goroutine scheduler
-  kvspace/          KV storage abstraction (Redis backend)
   vtype/            typed value system (int, float, bool, string, tensor)
   op/
     builtin/        native operators (arith, compare, logic, cast, call, io)

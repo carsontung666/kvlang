@@ -296,6 +296,13 @@ func TestDelegateRejectsProtectedWriteSlot(t *testing.T) {
 		{"后端注册表", "/sys/op/evil/0", "受保护域"},
 		{"设备层", "/dev/tty/x/stdout/detail", "受保护域"},
 		{"别的 vthread", "/vthread/999/r", "其它 vthread"},
+		// 非规范路径：纯前缀比较对它们无效，必须自己判段，不能指望 kvspace 兜底
+		{"上跳到 lib", "/foo/../lib/main/x", "规范"},
+		{"双斜杠", "//lib/x", "规范"},
+		{"当前目录段", "/./lib/x", "规范"},
+		{"跨 vthread 上跳", "/vthread/1/../999/x", "规范"},
+		{"尾斜杠", "/vthread/1/x/", "规范"},
+		{"vthread 域根", "/vthread", "域根"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := dispatch.CheckWriteKeyForTest("1", tc.slot); err == nil {

@@ -398,6 +398,11 @@ func WriteRwir(kv kvspace.KVSpace, pkg string, decl *ast.RwirDecl) {
 }
 
 func WriteFunc(kv kvspace.KVSpace, pkg string, fn *ast.Func) {
+	// 与 WriteRwir 同样的理由：空名会让 DelTree 退化成 DelTree("/lib")。
+	if fn.Sig.Name == "" {
+		logx.Warn("WriteFunc: 跳过无名 rwfunc（pkg=%q）", pkg)
+		return
+	}
 	typeMap := lower.InferTypes(fn)
 	kv.DelTree(keytree.LibFunc(pkg, fn.Sig.Name))
 	kvspace.MkIndexRecursive(kv, keytree.LibFunc(pkg, fn.Sig.Name)+"/")

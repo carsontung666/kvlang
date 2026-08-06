@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/array2d/kvspace-go"
@@ -49,69 +48,11 @@ type OpTask struct {
 	DoneKey string     `json:"done_key"`
 }
 
-// checkWriteKey 校验一个委托写槽的落点。
-//
-// 委托把写权限交到了 VM 之外：执行器拿到 outputs 里的绝对路径就直接写，而
-// kvspace 没有 ACL。所以派发之前必须限定落点。
-//
-// 允许：调用方自己的 vthread 子树、用户全局键（不在四个域根下的路径）。
-// 拒绝（三条均经实测可被利用）：
-//   - 末段以 ‥ 打头的引擎保留键 —— 写 ‥returnpc 可劫持控制流，写非 PC 值直接
-//     让下一轮 Execute 裸 panic；写 ‥ro 可关掉只读参防线
-//   - /lib —— 改写运行中的代码（VM 每次取指都重新从 KV 解码，注入立即生效）
-//   - /sys —— 篡改后端注册表、伪造别人的任务状态
-//   - /dev —— device 层把 detail 当文件路径 os.OpenFile(O_APPEND|O_CREATE) 或
-//     当 WebSocket URL 直连，等于任意文件写与 SSRF
-//   - 别的 vthread 子树
-//
-// # 这道校验的边界（别高估它）
-//
-//   - 它约束的是 VM 放进 outputs 的东西，**不是执行器沙箱**。任务描述里带着
-//     vtid 与 pc，不守协议的执行器完全可以自己推出危险键直接写。真正封死要靠
-//     kvspace 侧的作用域凭证或居中 broker。
-//   - 它校验的是**未解链**的字面路径，而 kvspace 的 Set 会跟随 link。若自己
-//     vthread 子树里存在一条指向 /lib 的 link，输出 /vthread/<own>/alias/x 能
-//     通过校验却落到 /lib/x（已实测）。当前无 kvlang 内建暴露 Link，故只有
-//     执行器能布这个局 —— 与上一条同一信任边界。
-//   - **原生 rwir 走的是另一扇门，这里管不到**：源码里 `"x" -> /sys/op/evil/0`
-//     直接写成功（已实测），因为绝对路径字面量是合法写槽且原样传给 kv.Set。
-//     那是语言层的既有面，不是委托引入的；此处不做处理，以免悄悄改变语义。
-func checkWriteKey(vtid, key string) error {
-	if key == "" || key[0] != '/' {
-		return fmt.Errorf("写槽不是绝对路径: %q", key)
-	}
-	// 自己判规范性，不依赖 kvspace 兜底 —— 它当前是「拒绝非规范路径」而非
-	// 「规范化后再用」，一旦哪天改成后者，纯前缀比较立刻被 ../ 绕过。
-	for _, seg := range strings.Split(strings.TrimPrefix(key, keytree.PathSegSep), keytree.PathSegSep) {
-		switch {
-		case seg == "" || seg == "." || seg == "..":
-			return fmt.Errorf("写槽不是规范路径: %q", key)
-		case strings.HasPrefix(seg, keytree.RuntimeMemberSep):
-			return fmt.Errorf("写槽指向引擎保留键: %q", key)
-		}
-	}
-	for _, deny := range []string{keytree.LibRoot, keytree.SysRoot, keytree.DevRoot, keytree.VthreadRoot} {
-		if key == deny {
-			return fmt.Errorf("写槽指向域根 %s: %q", deny, key)
-		}
-	}
-	for _, deny := range []string{keytree.LibRoot, keytree.SysRoot, keytree.DevRoot} {
-		if strings.HasPrefix(key, deny+keytree.PathSegSep) {
-			return fmt.Errorf("写槽指向受保护域 %s: %q", deny, key)
-		}
-	}
-	if strings.HasPrefix(key, keytree.VthreadRoot+keytree.PathSegSep) &&
-		!strings.HasPrefix(key, keytree.VThread(vtid)+keytree.PathSegSep) {
-		return fmt.Errorf("写槽指向其它 vthread: %q", key)
-	}
-	return nil
-}
-
 // buildTask 解析读写槽，构造 OpTask。
 //
 // 走 builtin 的解析函数而非自行拼路径 —— 与 VM 自身完全相同的路径，因此遵守
 // ‥rparam/‥wparam 零拷贝重定向，嵌套 rwfunc 帧内的局部变量也指向真实位置。
-func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) *OpTask {
+func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) (*OpTask, error) {
 	framePath := keytree.FrameRoot(pc)
 	task := &OpTask{
 		ID:      taskID,
@@ -124,9 +65,13 @@ func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) *Op
 		task.Inputs = append(task.Inputs, ParamRef{Value: builtin.ResolveReadValue(kv, framePath, r).String()})
 	}
 	for _, w := range inst.Writes {
-		task.Outputs = append(task.Outputs, ParamRef{Key: builtin.ResolveWriteKey(kv, framePath, w.Name)})
+		key, err := builtin.ResolveWriteKey(kv, framePath, w.Name)
+		if err != nil {
+			return nil, err // 落点校验：一旦 outputs 出了门，写就发生在 VM 之外
+		}
+		task.Outputs = append(task.Outputs, ParamRef{Key: key})
 	}
-	return task
+	return task, nil
 }
 
 // Delegate 把一条委托 rwir 派发给外部执行器并等待完成。
@@ -145,12 +90,9 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 	// taskID 必须带序号：scope 帧每轮循环复用同一 PC，仅靠 (vtid, pc) 会碰撞，
 	// 叠加持久化的 Notify 队列会让下一轮读走上一轮迟到的完成信号。
 	taskID := fmt.Sprintf("%s-%d", vtid, vthread.NextSeq(kv, keytree.VThreadDelegSeq(vtid)))
-	task := buildTask(kv, taskID, vtid, pc, inst)
-	// 派发之前把关：一旦 outputs 出了门，写就发生在 VM 之外。
-	for _, out := range task.Outputs {
-		if err := checkWriteKey(vtid, out.Key); err != nil {
-			return fail("%s: %v", inst.Opcode, err)
-		}
+	task, err := buildTask(kv, taskID, vtid, pc, inst)
+	if err != nil {
+		return fail("%s: %v", inst.Opcode, err)
 	}
 	specJSON, _ := json.Marshal(task) // OpTask 全是 string 字段，不可能失败
 

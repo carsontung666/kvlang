@@ -59,7 +59,10 @@ func readInputs(f *rwir.Frame) []kvspace.XValue {
 // writeResult writes a typed Value to the first write-slot and advances PC.
 func writeResult(f *rwir.Frame, result kvspace.XValue) error {
 	if len(f.Inst.Writes) > 0 {
-		key := resolveWriteSlot(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		key, err := writeSlotChecked(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		if err != nil {
+			return writeDenied(f.KV, f.Vtid, f.PC, err)
+		}
 		if err := f.KV.Set([]kvspace.KVPair{{key, result}}); err != nil {
 			return err
 		}
@@ -70,8 +73,8 @@ func writeResult(f *rwir.Frame, result kvspace.XValue) error {
 
 // ResolveWriteKey 返回写槽的绝对 KV key —— 导出给 rwir/dispatch 用，
 // 使委托路径与 VM 自身走完全相同的写槽解析（含 ‥wparam 零拷贝重定向）。
-func ResolveWriteKey(kv kvspace.KVSpace, framePath, name string) string {
-	return resolveWriteSlot(kv, framePath, name)
+func ResolveWriteKey(kv kvspace.KVSpace, framePath, name string) (string, error) {
+	return writeSlotChecked(kv, framePath, name)
 }
 
 // resolveWriteSlot 返回写槽的绝对 KV key（先查 .wparam 重定向，再处理绝对路径）。
@@ -84,6 +87,13 @@ func resolveWriteSlot(kv kvspace.KVSpace, framePath, name string) string {
 	return keytree.Stack(rwRoot) + name
 }
 
+// writeSlotChecked 解析写槽并校验落点。所有写路径（原生与委托）都必须走它，
+// 否则守住一扇门等于没守——`f(x) -> tmp` 再 `tmp -> /lib/pwned` 两行即可绕过。
+func writeSlotChecked(kv kvspace.KVSpace, framePath, name string) (string, error) {
+	key := resolveWriteSlot(kv, framePath, name)
+	return key, keytree.CheckWriteKey(keytree.VtidFromPC(framePath), key)
+}
+
 // nextPC advances PC without writing a result.
 func nextPC(f *rwir.Frame) {
 	vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")
@@ -91,7 +101,18 @@ func nextPC(f *rwir.Frame) {
 
 // setWrite writes a typed Value to a named slot (先查 .wparam 重定向).
 func setWrite(kv kvspace.KVSpace, framePath, slot string, val kvspace.XValue) error {
-	return kv.Set([]kvspace.KVPair{{resolveWriteSlot(kv, framePath, slot), val}})
+	key, err := writeSlotChecked(kv, framePath, slot)
+	if err != nil {
+		return err
+	}
+	return kv.Set([]kvspace.KVPair{{key, val}})
+}
+
+// writeDenied 把落点校验失败转成 vthread 异常终止。
+func writeDenied(kv kvspace.KVSpace, vtid, pc string, err error) error {
+	msg := "RuntimeError: " + err.Error()
+	vthread.SetError(bg, kv, vtid, pc, msg)
+	return fmt.Errorf("%s", msg)
 }
 
 // isContainerKind reports whether a kind represents a container/marker type
@@ -136,7 +157,10 @@ func ExecuteCopy(kv kvspace.KVSpace, vtid, pc string, inst *rwir.Rwir) error {
 	}
 	v := resolveReadValue(kv, framePath, inst.Reads[0])
 	for _, w := range inst.Writes {
-		key := resolveWriteSlot(kv, framePath, w.Name)
+		key, err := writeSlotChecked(kv, framePath, w.Name)
+		if err != nil {
+			return writeDenied(kv, vtid, pc, err)
+		}
 		if err := kv.Set([]kvspace.KVPair{{key, v}}); err != nil {
 			return err
 		}

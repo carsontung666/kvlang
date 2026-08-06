@@ -454,12 +454,16 @@ func (p *parser) parseRwirDecl() ast.RwirDecl {
 // parseFuncSig 消费 rwfunc name(...) -> (...) 签名，直接构造 ast.FuncSig。
 // 不经中间字符串，不需要 tokensToSig。
 func (p *parser) parseFuncSig() ast.FuncSig {
-	p.advance() // consume 'rwfunc' / 'rwir'
+	kw := p.advance() // consume 'rwfunc' / 'rwir'
 	var sig ast.FuncSig
 	if t := p.peek(); t.Kind == Ident {
 		sig.Name = t.Value
 		p.advance()
 		sig.Name += p.parseDottedTail()
+	} else {
+		// 与 parseRwirDecl 同理：无名会让 WriteFunc 的 DelTree 退化成 DelTree("/lib")
+		p.errors = append(p.errors, Diagnostic{Pos: kw.Pos,
+			Message: "SyntaxError: " + kw.Value + " 缺少名字；help: 写成 " + kw.Value + " name(a:t) -> (b:t)"})
 	}
 	if p.peek().Kind == LParen {
 		p.advance()

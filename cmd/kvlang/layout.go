@@ -16,8 +16,7 @@ import (
 )
 
 // cmdLayout 将 .kv 文件加载进 kvspace，不执行。多文件拼接为单源解析。
-// 返回是否含可执行代码 —— 只含 rwir 声明的接口文件返回 false，调用方不应尝试执行。
-func cmdLayout(args []string) bool {
+func cmdLayout(args []string) {
 	fs := flag.NewFlagSet("layout", flag.ExitOnError)
 	dsn := fs.String("kvspace", defaultKVSpace(), kvspaceFlagDesc)
 	fs.Usage = func() {
@@ -72,7 +71,6 @@ func cmdLayout(args []string) bool {
 	}
 	if !anyCode && len(df.RwirDecls) == 0 { logx.Fatal("no executable code found") }
 	logx.Info("loaded %d file(s) → ready", len(allFiles))
-	return anyCode
 }
 
 // ── 文件 → kvspace（加载，不涉及执行）─────────────────────────────────

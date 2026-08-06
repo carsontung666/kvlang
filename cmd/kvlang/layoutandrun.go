@@ -19,10 +19,9 @@ func cmdLayoutAndRun(args []string) {
 		runLib("", "init", false)
 		return
 	}
-	// 只含 rwir 声明的接口文件：注册完即止，不去找 init（否则 Bootstrap 失败）
-	if !cmdLayout(args) { return }
-	entry := findEntry(defaultKVSpace())
-	runLib("", entry, false)
+	// 复用 run 的加载路径：loadFunctions 返回 false（只含声明的接口文件）时
+	// 自然不执行，不必再造一份「有没有可执行代码」的判断。
+	runFiles(defaultKVSpace(), args, false)
 }
 
 func findEntry(dsn string) string {

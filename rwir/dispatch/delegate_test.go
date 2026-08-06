@@ -284,39 +284,67 @@ rwfunc plain(a:string) -> (b:string) { a -> b }
 	}
 }
 
-// TestDelegateRejectsProtectedWriteSlot 覆盖对抗测试实证出的三条劫持路径：
-// 委托的写槽落到引擎保留键（‥returnpc 可劫持控制流、写非 PC 值让 VM 裸 panic）、
-// 落到 /lib（改写运行中的代码）、落到 /dev（device 层会把它当文件路径 open）。
-// 这些必须在派发**之前**被拒 —— 一旦 outputs 出了门，写就发生在 VM 之外。
-func TestDelegateRejectsProtectedWriteSlot(t *testing.T) {
+// TestWriteToProtectedDomainIsDenied 端到端验证落点校验真的拦住了执行。
+// 关键是断言**后端一个任务都没收到** —— 只测校验函数本身的话，把 Delegate 里的
+// 调用整段删掉测试仍会全绿（上一轮就栽在这种「函数被测了、功能没被测」上）。
+func TestWriteToProtectedDomainIsDenied(t *testing.T) {
 	for _, tc := range []struct{ name, slot, want string }{
-		{"引擎保留键", "/vthread/1/‥returnpc", "引擎保留键"},
-		{"帧内保留键", "/vthread/1/[0,0]/‥ro", "引擎保留键"},
-		{"运行中的代码", "/lib/main/[1,0]", "受保护域"},
+		{"运行中的代码", "/lib/pwned", "受保护域"},
 		{"后端注册表", "/sys/op/evil/0", "受保护域"},
 		{"设备层", "/dev/tty/x/stdout/detail", "受保护域"},
-		{"别的 vthread", "/vthread/999/r", "其它 vthread"},
-		// 非规范路径：纯前缀比较对它们无效，必须自己判段，不能指望 kvspace 兜底
-		{"上跳到 lib", "/foo/../lib/main/x", "规范"},
-		{"双斜杠", "//lib/x", "规范"},
-		{"当前目录段", "/./lib/x", "规范"},
-		{"跨 vthread 上跳", "/vthread/1/../999/x", "规范"},
-		{"尾斜杠", "/vthread/1/x/", "规范"},
-		{"vthread 域根", "/vthread", "域根"},
+		{"别的 vthread", "/vthread/999/stolen", "越出本 vthread"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := dispatch.CheckWriteKeyForTest("1", tc.slot); err == nil {
-				t.Fatalf("写槽 %q 应被拒绝", tc.slot)
-			} else if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("错误原因应含 %q，实得 %v", tc.want, err)
+			kv := newKV(t)
+			be := startBackend(t, kv, "fake", "echo")
+			loadSrc(t, kv, "rwir fake.echo(a:string) -> (b:string)\n\n"+
+				"rwfunc main() -> () {\n\tfake.echo(\"X\") -> "+tc.slot+"\n}\n\nmain()\n")
+
+			vtid := vthread.AllocVtid(kv)
+			kv.DelTree(keytree.VThread(vtid))
+			kvspace.MkIndexRecursive(kv, keytree.VThread(vtid)+keytree.PathSegSep)
+			builtin.WriteSysRwir(kv)
+			pc := layout.Bootstrap(context.Background(), kv, vtid, "init", nil)
+			vthread.Set(context.Background(), kv, vtid, pc, "init")
+			err := kvcpu.New(kv, "test").Execute(pc)
+			be.stop()
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("写 %s 应被拒，实得 err=%v", tc.slot, err)
+			}
+			if v := kvspace.GetOne(kv, tc.slot); !kvspace.IsNone(v) {
+				t.Fatalf("%s 不该被写入，实得 %q", tc.slot, v.String())
+			}
+			if len(be.seen) != 0 {
+				t.Fatalf("校验必须在派发**之前**发生，后端不该收到任务，实得 %v", be.seen)
 			}
 		})
 	}
-	// 合法落点必须放行：自己帧内的槽位、用户全局键
-	for _, ok := range []string{"/vthread/1/[0,0]/r", "/vthread/1/x", "/n1", "/mydata/x"} {
-		if err := dispatch.CheckWriteKeyForTest("1", ok); err != nil {
-			t.Errorf("合法写槽 %q 被误拒: %v", ok, err)
-		}
+}
+
+// TestNativeWriteToProtectedDomainIsDenied 覆盖「多写一行就绕过」的攻击：
+// 委托写到安全的局部变量，再用原生 copy 搬到受保护位置。守住一扇门等于没守。
+func TestNativeWriteToProtectedDomainIsDenied(t *testing.T) {
+	kv := newKV(t)
+	loadSrc(t, kv, `
+rwfunc main() -> () {
+	"PWN" -> /lib/pwned
+}
+
+main()
+`)
+	vtid := vthread.AllocVtid(kv)
+	kv.DelTree(keytree.VThread(vtid))
+	kvspace.MkIndexRecursive(kv, keytree.VThread(vtid)+keytree.PathSegSep)
+	builtin.WriteSysRwir(kv)
+	pc := layout.Bootstrap(context.Background(), kv, vtid, "init", nil)
+	vthread.Set(context.Background(), kv, vtid, pc, "init")
+
+	if err := kvcpu.New(kv, "test").Execute(pc); err == nil || !strings.Contains(err.Error(), "受保护域") {
+		t.Fatalf("原生写 /lib 应被拒，实得 %v", err)
+	}
+	if v := kvspace.GetOne(kv, "/lib/pwned"); !kvspace.IsNone(v) {
+		t.Fatalf("/lib/pwned 不该被写入，实得 %q", v.String())
 	}
 }
 

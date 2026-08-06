@@ -25,6 +25,7 @@ import (
 
 	"kvlang/ast"
 	"kvlang/keytree"
+	"kvlang/logx"
 	"kvlang/symbol"
 	"github.com/array2d/kvspace-go"
 	"kvlang/lower"
@@ -132,21 +133,7 @@ func HandleCall(ctx context.Context, kv kvspace.KVSpace, pc string, inst *rwir.R
 	vtid := keytree.VtidFromPC(pc)
 	funcName := inst.Reads[0].Name
 
-	var pkg string
-	libPrefix := keytree.LibRoot + keytree.PathSegSep
-	if strings.HasPrefix(funcName, libPrefix) {
-		rest := funcName[len(libPrefix):]
-		if dot := strings.LastIndex(rest, keytree.MemberSep); dot > 0 {
-			pkg = rest[:dot]
-			funcName = rest[dot+len(keytree.MemberSep):]
-		} else {
-			funcName = rest
-		}
-	} else if dot := strings.LastIndex(funcName, keytree.MemberSep); dot > 0 {
-		pkg = funcName[:dot]
-		funcName = funcName[dot+len(keytree.MemberSep):]
-	}
-	funcKey := keytree.LibFunc(pkg, funcName)
+	funcKey := keytree.FuncKey(funcName)
 
 	sigVal := kvspace.GetOne(kv, funcKey)
 	if kvspace.IsNone(sigVal) {
@@ -330,12 +317,7 @@ func RegisterBlocks(kv kvspace.KVSpace, pkg, parent string, body []ast.Stmt) {
 
 // Bootstrap 为 vthread 的顶层入口函数建立虚线程根帧。
 func Bootstrap(ctx context.Context, kv kvspace.KVSpace, vtid, funcName string, args []string) string {
-	pkg, name := "", funcName
-	if dot := strings.LastIndex(funcName, keytree.MemberSep); dot > 0 {
-		pkg = funcName[:dot]
-		name = funcName[dot+len(keytree.MemberSep):]
-	}
-	funcKey := keytree.LibFunc(pkg, name)
+	funcKey := keytree.FuncKey(funcName)
 
 	vthreadRoot := keytree.VThread(vtid)
 	kvspace.MkIndexRecursive(kv, keytree.Stack(vthreadRoot))
@@ -389,8 +371,53 @@ func countDirectInsts(body []ast.Stmt) int32 {
 	return n
 }
 
+// WriteDecls 把一个源文件里的全部 rwir 声明写入 /lib。
+// 声明未指定 lib 归属时落到文件的包名下（与 Funcs 的处理一致）。
+//
+// 此前没有任何路径调用 WriteRwir —— rwir 声明被 parser 解析后只有 ast/format.go
+// 读得到，装载时静默丢弃，于是 /lib 下永远不存在 kind=rwir 的键。
+func WriteDecls(kv kvspace.KVSpace, df *ast.File) {
+	// 同一份源码里被同名 rwfunc 盖掉的声明。调用点会走本地函数体，声明形同虚设 ——
+	// 而且顺序无关：WriteDecls 总在 WriteFunc 之前跑，rwfunc 恒胜。
+	funcKeys := map[string]bool{}
+	for i := range df.Funcs {
+		fpkg := df.Funcs[i].Pkg
+		if fpkg == "" {
+			fpkg = df.Package
+		}
+		funcKeys[keytree.LibFunc(fpkg, df.Funcs[i].Sig.Name)] = true
+	}
+
+	for i := range df.RwirDecls {
+		pkg := df.RwirDecls[i].Pkg
+		if pkg == "" {
+			pkg = df.Package
+		}
+		name := df.RwirDecls[i].Sig.Name
+		// 两种"声明写了却永远不会被派发"的情形都要出声。静默的代价是：
+		// 用户以为自己接上了外部执行器，实际跑的是别的东西，且退出码为 0。
+		if funcKeys[keytree.LibFunc(pkg, name)] {
+			logx.Warn("rwir %s 被同名 rwfunc 覆盖 —— 调用点会执行本地函数体，不会派发给执行器", keytree.LibFunc(pkg, name))
+		}
+		callName := name
+		if pkg != "" {
+			callName = pkg + keytree.MemberSep + name
+		}
+		if builtin.IsNativeOp(callName) || rwir.IsControlOp(callName) {
+			logx.Warn("rwir %s 与内建算子同名 —— 调用点会走内建实现，声明不会生效", callName)
+		}
+		WriteRwir(kv, pkg, &df.RwirDecls[i])
+	}
+}
+
 // WriteRwir 将 rwir 声明写入 /lib/<pkg>/<name>，kind="rwir"，无指令体。
 func WriteRwir(kv kvspace.KVSpace, pkg string, decl *ast.RwirDecl) {
+	// 空名会让下面的 DelTree 退化成 DelTree("/lib") —— 抹掉整个函数库。
+	// parser 已对无名声明报错，这里是第二道防线：代价太大，不能只防一层。
+	if decl.Sig.Name == "" {
+		logx.Warn("WriteRwir: 跳过无名 rwir 声明（pkg=%q）", pkg)
+		return
+	}
 	kv.DelTree(keytree.LibFunc(pkg, decl.Sig.Name))
 	kv.Set([]kvspace.KVPair{
 		{keytree.LibFunc(pkg, decl.Sig.Name), kvspace.NewRwir(decl.Sig.NumReads(), decl.Sig.NumWrites(), decl.SigString())},
@@ -398,6 +425,11 @@ func WriteRwir(kv kvspace.KVSpace, pkg string, decl *ast.RwirDecl) {
 }
 
 func WriteFunc(kv kvspace.KVSpace, pkg string, fn *ast.Func) {
+	// 与 WriteRwir 同样的理由：空名会让 DelTree 退化成 DelTree("/lib")。
+	if fn.Sig.Name == "" {
+		logx.Warn("WriteFunc: 跳过无名 rwfunc（pkg=%q）", pkg)
+		return
+	}
 	typeMap := lower.InferTypes(fn)
 	kv.DelTree(keytree.LibFunc(pkg, fn.Sig.Name))
 	kvspace.MkIndexRecursive(kv, keytree.LibFunc(pkg, fn.Sig.Name)+"/")

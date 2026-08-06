@@ -72,6 +72,8 @@ func runCode(name string, rc io.Reader, dsn string, debug bool) {
 	if err != nil { logx.Fatal("parse: %v", err) }
 	for _, d := range diags { d.SrcName = "<inline>"; logx.Diag(d) }
 	if parser.HasErrors(diags) { logx.Fatal("parse: error-level diagnostics — refusing to execute") }
+	// 声明先注册：内联/管道代码里 `rwir x()` 与调用点常在同一段源码里
+	layout.WriteDecls(kv, df)
 	if len(df.Funcs) == 0 && len(df.TopLevelCalls) == 0 && len(df.InitBody) == 0 { return }
 	for i := range df.Funcs {
 		fpkg := df.Funcs[i].Pkg

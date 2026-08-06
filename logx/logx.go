@@ -18,11 +18,23 @@ package logx
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
 	"kvlang/parser"
 )
+
+// out 是所有诊断的落点。默认 stderr；测试用 SetOutputForTest 换掉它，
+// 好让"某某情况必须出声告警"这类断言能落在真实输出上，而不是内部标志位。
+var out io.Writer = os.Stderr
+
+// SetOutputForTest 临时改写日志落点，返回还原函数。仅供测试使用。
+func SetOutputForTest(w io.Writer) func() {
+	old := out
+	out = w
+	return func() { out = old }
+}
 
 type level int
 
@@ -50,25 +62,25 @@ func init() {
 
 func Debug(format string, args ...any) {
 	if currentLevel <= levelDebug {
-		fmt.Fprintf(os.Stderr, format+"\n", args...)
+		fmt.Fprintf(out, format+"\n", args...)
 	}
 }
 
 func Info(format string, args ...any) {
 	if currentLevel <= levelInfo {
-		fmt.Fprintf(os.Stderr, format+"\n", args...)
+		fmt.Fprintf(out, format+"\n", args...)
 	}
 }
 
 func Warn(format string, args ...any) {
 	if currentLevel <= levelWarn {
-		fmt.Fprintf(os.Stderr, "warn: "+format+"\n", args...)
+		fmt.Fprintf(out, "warn: "+format+"\n", args...)
 	}
 }
 
 func Error(format string, args ...any) {
 	if currentLevel <= levelError {
-		fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
+		fmt.Fprintf(out, "error: "+format+"\n", args...)
 	}
 }
 
@@ -81,15 +93,15 @@ func Fatal(format string, args ...any) {
 func Diag(d parser.Diagnostic) {
 	if d.Info {
 		if currentLevel <= levelInfo {
-			fmt.Fprintln(os.Stderr, d.String())
+			fmt.Fprintln(out, d.String())
 		}
 	} else if d.Warn {
 		if currentLevel <= levelWarn {
-			fmt.Fprintln(os.Stderr, d.String())
+			fmt.Fprintln(out, d.String())
 		}
 	} else {
 		if currentLevel <= levelError {
-			fmt.Fprintln(os.Stderr, d.String())
+			fmt.Fprintln(out, d.String())
 		}
 	}
 }
@@ -106,9 +118,9 @@ func DiagWithSource(d parser.Diagnostic) {
 		return
 	}
 	if d.Source != "" {
-		fmt.Fprintf(os.Stderr, "%s\n  %s\n  %s%c\n", d.String(), d.Source,
+		fmt.Fprintf(out, "%s\n  %s\n  %s%c\n", d.String(), d.Source,
 			strings.Repeat(" ", d.Pos.Col-1), '^')
 	} else {
-		fmt.Fprintln(os.Stderr, d.String())
+		fmt.Fprintln(out, d.String())
 	}
 }

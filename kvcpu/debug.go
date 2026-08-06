@@ -43,7 +43,7 @@ func debugNotifyPause(_ context.Context, kv kvspace.KVSpace, vtid, pc string, in
 
 // debugWaitResume 阻塞等待 /vthread/<vtid>/.debugger.resume 上的 Notify，
 // 返回 agent 发送的命令字符串（"step" / "continue" / "abort"）。
-// 使用超时重试，与 vthread.WaitDone 保持一致的模式。
+// 使用超时重试：Watch 超时返回空值即再等一轮，不把超时当成命令。
 func debugWaitResume(kv kvspace.KVSpace, vtid string) string {
 	for {
 		val := kv.Watch(keytree.VThreadDebuggerResume(vtid), 30*time.Second)

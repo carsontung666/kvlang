@@ -22,6 +22,7 @@ jobs:
           go-version: "1.24"
       - run: go mod tidy
       - run: go build ./...
+      - run: go test ./... -count=1
 
   # ── tutorial 集成测试（需要 Redis）────────────────────────────────────────
   tutorial-test:
@@ -43,9 +44,15 @@ jobs:
           go-version: "1.24"
       - run: go mod tidy
       - run: go build -o kvlang ./cmd/kvlang/
-      - run: go install github.com/array2d/kvspace-go/cmd/kvspace@latest
+      # 从 go.mod 钉住的版本构建 CLI，不能用 @latest —— 唯一的 tag v0.1.0
+      # 与本仓库的 API 及值编码都不同源
+      - run: go build -o /usr/local/bin/kvspace github.com/array2d/kvspace-go/cmd/kvspace
       - run: python3 -m unittest tutorial.test.BenchmarkTest
       - run: python3 tutorial/test.py
+      # 委托 rwir 的跨进程验收：go test 里的执行器是同进程 goroutine，
+      # 只有真起两个进程才验得到 CLI 值编码、参数顺序、键布局。
+      # PORT 显式给出 = 复用上面的 service 容器（脚本会 clear 它）。
+      - run: PORT=6379 sh examples/delegate/run.sh
 
   # ── 多平台交叉编译（仅 tag 时生成 release 产物）─────────────────────────
   release:

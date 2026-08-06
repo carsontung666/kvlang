@@ -54,7 +54,8 @@ func cmdLayout(args []string) {
 	for _, d := range diags { logx.Diag(d) }
 	if parser.HasErrors(diags) { logx.Fatal("parse: error-level diagnostics — refusing to load") }
 
-	anyCode := false
+	anyCode := false // 可执行代码（rwfunc / 顶层调用），不含纯声明
+	layout.WriteDecls(kv, df)
 	for i := range df.Funcs {
 		fpkg := df.Funcs[i].Pkg
 		if fpkg == "" { fpkg = df.Package }
@@ -68,7 +69,8 @@ func cmdLayout(args []string) {
 		layout.WriteFunc(kv, "", lower.Func(&initFn))
 		anyCode = true
 	}
-	if !anyCode { logx.Fatal("no executable code found") }
+	// 只含 rwir 声明的文件是合法的接口文件：注册完就安静退出，不算"无代码"
+	if !anyCode && len(df.RwirDecls) == 0 { logx.Fatal("no executable code found") }
 	logx.Info("loaded %d file(s) → ready", len(allFiles))
 }
 
@@ -115,6 +117,9 @@ func _loadFile(kv kvspace.KVSpace, f string, anyCode *bool, loaded map[string]bo
 	for _, d := range diags { d.SrcName = f; logx.Diag(d) }
 	if parser.HasErrors(diags) { logx.Fatal("%s: error-level diagnostics — refusing to load", f) }
 
+	// 声明写入 /lib 但不置 anyCode —— loadFunctions 的返回值决定要不要执行，
+	// 只含声明的文件是合法的接口文件，注册完就该安静退出，不去找 init。
+	layout.WriteDecls(kv, df)
 	for i := range df.Funcs {
 		fpkg := df.Funcs[i].Pkg
 		if fpkg == "" { fpkg = df.Package }

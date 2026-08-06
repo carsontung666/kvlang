@@ -68,6 +68,13 @@ func writeResult(f *rwir.Frame, result kvspace.XValue) error {
 	return nil
 }
 
+// ResolveWriteSlot 返回写槽的绝对 KV key，供 VM 之外的写入方（rwir/dispatch 的
+// 委托任务 outputs）复用。委托必须与原生写走同一条解析路径，否则同一个写槽
+// 在两条路上会落到不同的键 —— 尤其是 ‥wparam 零拷贝重定向。
+func ResolveWriteSlot(kv kvspace.KVSpace, framePath, name string) string {
+	return resolveWriteSlot(kv, framePath, name)
+}
+
 // resolveWriteSlot 返回写槽的绝对 KV key（先查 .wparam 重定向，再处理绝对路径）。
 func resolveWriteSlot(kv kvspace.KVSpace, framePath, name string) string {
 	if isAbsolute(name) { return name }

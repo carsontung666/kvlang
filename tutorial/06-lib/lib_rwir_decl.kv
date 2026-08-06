@@ -1,0 +1,16 @@
+# 期望输出:
+#   lib 里的 rwir 声明不该影响执行
+#
+# 回归用例：lib 块内的 rwir 声明曾使整个程序静默变成空操作
+# （parseLibBody 的 rwir 分支缺 continue → 往 init 塞幻影空指令 → 立刻 SetDone）。
+# 这里只验证声明不干扰执行；真正派发到外部执行器的例子在 examples/delegate/。
+
+lib llm {
+	rwir chat(prompt:string) -> (reply:string)
+}
+
+rwfunc main() -> () {
+	println("lib 里的 rwir 声明不该影响执行")
+}
+
+main()

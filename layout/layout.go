@@ -25,6 +25,7 @@ import (
 
 	"kvlang/ast"
 	"kvlang/keytree"
+	"kvlang/logx"
 	"kvlang/symbol"
 	"github.com/array2d/kvspace-go"
 	"kvlang/lower"
@@ -384,6 +385,12 @@ func WriteDecls(kv kvspace.KVSpace, df *ast.File) {
 
 // WriteRwir 将 rwir 声明写入 /lib/<pkg>/<name>，kind="rwir"，无指令体。
 func WriteRwir(kv kvspace.KVSpace, pkg string, decl *ast.RwirDecl) {
+	// 空名会让下面的 DelTree 退化成 DelTree("/lib") —— 抹掉整个函数库。
+	// parser 已对无名声明报错，这里是第二道防线：代价太大，不能只防一层。
+	if decl.Sig.Name == "" {
+		logx.Warn("WriteRwir: 跳过无名 rwir 声明（pkg=%q）", pkg)
+		return
+	}
 	kv.DelTree(keytree.LibFunc(pkg, decl.Sig.Name))
 	kv.Set([]kvspace.KVPair{
 		{keytree.LibFunc(pkg, decl.Sig.Name), kvspace.NewRwir(decl.Sig.NumReads(), decl.Sig.NumWrites(), decl.SigString())},

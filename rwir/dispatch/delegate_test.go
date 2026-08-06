@@ -52,9 +52,22 @@ func loadSrc(t *testing.T, kv kvspace.KVSpace, src string) {
 	}
 }
 
+// backend 是测试用的 echo 执行器。seen 记录它见过的全部 taskID。
+type backend struct {
+	seen     []string
+	done     chan struct{}
+	finished chan struct{}
+}
+
+// stop 关停执行器并**等它真的退出** —— 否则残留的 watcher 会和下一个测试
+// 抢同一条 cmd 队列，且 t.Errorf 可能在测试结束后触发 panic。
+func (b *backend) stop() {
+	close(b.done)
+	<-b.finished
+}
+
 // startBackend 起一个 echo 执行器：注册能力，然后循环消费命令队列。
-// 返回的 stop 关闭后 goroutine 退出。
-func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) (stop func()) {
+func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) *backend {
 	t.Helper()
 	if err := kv.Set([]kvspace.KVPair{
 		{Key: keytree.SysOpFunc(name, op), Val: kvspace.NewChar("1")},
@@ -67,12 +80,13 @@ func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) (stop func(
 		t.Fatalf("register instance: %v", err)
 	}
 
-	done := make(chan struct{})
+	b := &backend{done: make(chan struct{}), finished: make(chan struct{})}
 	go func() {
+		defer close(b.finished)
 		queue := keytree.SysOpCmd(name, "0")
 		for {
 			select {
-			case <-done:
+			case <-b.done:
 				return
 			default:
 			}
@@ -85,6 +99,7 @@ func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) (stop func(
 				t.Errorf("backend: bad task JSON %q: %v", raw.String(), err)
 				continue
 			}
+			b.seen = append(b.seen, task.ID)
 			// echo：把第一个输入原样写进每个输出槽
 			var val string
 			if len(task.Inputs) > 0 {
@@ -100,7 +115,7 @@ func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) (stop func(
 			kv.Notify(task.DoneKey, kvspace.NewChar("1"))
 		}
 	}()
-	return func() { close(done) }
+	return b
 }
 
 // run 编译并执行 entry，返回 vtid。
@@ -121,13 +136,21 @@ func run(t *testing.T, kv kvspace.KVSpace, entry string) string {
 	return vtid
 }
 
+// newKV 返回一个干净的 kvspace。
+//
+// art:// 是**进程内全局单例** —— Conn 不会给出独立实例，DisConn 也不清空。
+// 不显式清理的话，上一个测试残留的 /lib/main 会串进下一个测试，`go test -shuffle=on`
+// 就会随机失败。必须清根，不能只建索引。
 func newKV(t *testing.T) kvspace.KVSpace {
 	t.Helper()
 	kv := kvspace.Conn("art://")
 	if kv == nil {
 		t.Fatal("Conn(art://) 返回 nil")
 	}
-	t.Cleanup(func() { kv.DisConn() })
+	for _, root := range []string{keytree.LibRoot, keytree.VthreadRoot, keytree.SysOpRoot,
+		keytree.SysRoot + keytree.PathSegSep + keytree.SegTask} {
+		kv.DelTree(root)
+	}
 	kvspace.MkIndexRecursive(kv, keytree.LibRoot+keytree.PathSegSep)
 	kvspace.MkIndexRecursive(kv, keytree.VthreadRoot+keytree.PathSegSep)
 	return kv
@@ -137,7 +160,8 @@ func newKV(t *testing.T) kvspace.KVSpace {
 // 输出必须经 ‥wparam 零拷贝重定向落到**调用方**的槽位。
 func TestDelegateWriteParamRedirect(t *testing.T) {
 	kv := newKV(t)
-	defer startBackend(t, kv, "fake", "echo")()
+	be := startBackend(t, kv, "fake", "echo")
+	defer be.stop()
 
 	loadSrc(t, kv, `
 rwir fake.echo(a:string) -> (b:string)
@@ -165,7 +189,7 @@ main()
 // 叠加持久化的 Notify 队列会让下一轮读走上一轮迟到的完成信号。
 func TestDelegateTaskIDUniquePerIteration(t *testing.T) {
 	kv := newKV(t)
-	defer startBackend(t, kv, "fake", "echo")()
+	be := startBackend(t, kv, "fake", "echo")
 
 	loadSrc(t, kv, `
 rwir fake.echo(a:string) -> (b:string)
@@ -181,10 +205,21 @@ rwfunc main() -> () {
 main()
 `)
 	vtid := run(t, kv, "init")
+	be.stop()
 
-	seq := kvspace.GetOne(kv, keytree.VThreadAt(vtid, keytree.RuntimeMemberSep+"delegseq"))
-	if seq.String() != "3" {
-		t.Fatalf("三轮循环应产生三个不同 taskID，delegseq=%q，期望 \"3\"", seq.String())
+	if len(be.seen) != 3 {
+		t.Fatalf("后端应收到 3 个任务，实得 %d 个：%v", len(be.seen), be.seen)
+	}
+	uniq := map[string]bool{}
+	for _, id := range be.seen {
+		uniq[id] = true
+	}
+	if len(uniq) != 3 {
+		t.Fatalf("三轮的 taskID 必须互不相同，实得 %v", be.seen)
+	}
+	// 顺带确认循环体真的跑了、结果真的写回了
+	if got := kvspace.GetOne(kv, keytree.VThreadAt(vtid, "[0,0]/out")); got.String() != "v" {
+		t.Fatalf("out=%q，期望 \"v\"", got.String())
 	}
 }
 
@@ -206,10 +241,14 @@ main()
 	kvspace.MkIndexRecursive(kv, keytree.VThread(vtid)+keytree.PathSegSep)
 	builtin.WriteSysRwir(kv)
 	pc := layout.Bootstrap(context.Background(), kv, vtid, "main", nil)
+	if pc == "" {
+		t.Fatal("Bootstrap main failed")
+	}
 	vthread.Set(context.Background(), kv, vtid, pc, "init")
 
-	if err := kvcpu.New(kv, "test").Execute(pc); err == nil {
-		t.Fatal("无后端时 Execute 应返回错误")
+	err := kvcpu.New(kv, "test").Execute(pc)
+	if err == nil || !strings.Contains(err.Error(), "no backend supports") {
+		t.Fatalf("期望路由失败错误，实得 %v", err)
 	}
 	msg := kvspace.GetOne(kv, keytree.VThreadStatusMsg(vtid, "error"))
 	if !strings.Contains(msg.String(), "no backend supports") {

@@ -234,10 +234,14 @@ func (p *parser) parseLibBody(f *ast.File, prefix string) {
 			continue
 		}
 		if p.peek().Kind == Ident && p.peek().Value == "rwir" {
-				decl := p.parseRwirDecl()
-				decl.Pkg = pkg // lib 归属
-				f.RwirDecls = append(f.RwirDecls, decl)
-			} else if p.peek().Kind == Ident && p.peek().Value == "rwfunc" {
+			decl := p.parseRwirDecl()
+			decl.Pkg = pkg // lib 归属
+			f.RwirDecls = append(f.RwirDecls, decl)
+			p.skipNewlines()
+			continue // 缺 continue 会落到下面的 parseStmt，往 init 里塞一条幻影空指令，
+			         // 使 /lib/init/[0,0] 变成空 opcode → vthread 立刻 SetDone("ok")，
+			         // 整个程序静默变成空操作
+		} else if p.peek().Kind == Ident && p.peek().Value == "rwfunc" {
 			fn := p.parseFunc()
 			fn.Pkg = pkg // lib 归属（fix-039）
 			f.Funcs = append(f.Funcs, fn)
@@ -418,12 +422,17 @@ func (p *parser) parseDottedTail() string {
 
 // parseRwirDecl 解析 rwir name(...) -> (...) 声明（无体）。
 func (p *parser) parseRwirDecl() ast.RwirDecl {
-	p.advance() // consume 'rwir'
+	kw := p.advance() // consume 'rwir'
 	var decl ast.RwirDecl
 	if t := p.peek(); t.Kind == Ident {
 		decl.Sig.Name = t.Value
 		p.advance()
 		decl.Sig.Name += p.parseDottedTail()
+	} else {
+		// 无名声明必须报错：WriteRwir 会 DelTree(LibFunc(pkg, name))，
+		// 空名 + 空包名 = DelTree("/lib")，静默抹掉整个函数库。
+		p.errors = append(p.errors, Diagnostic{Pos: kw.Pos,
+			Message: "SyntaxError: rwir 声明缺少名字；help: 写成 rwir name(a:t) -> (b:t)"})
 	}
 	if p.peek().Kind == LParen {
 		p.advance()

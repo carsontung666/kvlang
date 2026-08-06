@@ -19,7 +19,8 @@ func cmdLayoutAndRun(args []string) {
 		runLib("", "init", false)
 		return
 	}
-	cmdLayout(args)
+	// 只含 rwir 声明的接口文件：注册完即止，不去找 init（否则 Bootstrap 失败）
+	if !cmdLayout(args) { return }
 	entry := findEntry(defaultKVSpace())
 	runLib("", entry, false)
 }

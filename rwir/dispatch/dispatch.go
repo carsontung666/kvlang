@@ -28,7 +28,14 @@ import (
 )
 
 // defaultTimeout 委托调用的兜底超时。
-const defaultTimeout = 30 * time.Second
+//
+// 是 var 不是 const —— 测试要覆盖超时路径就必须能调小它，否则每个用例都得等
+// 30 秒，结果就是没人测（把 Watch 之后的 status 复查整段删掉，测试仍会全绿）。
+//
+// TODO(阶段2): 拆成两个，照 Temporal 的做法 —— StartToClose 界定合法时长、
+// HeartbeatTimeout 界定沉默时长，均从 /sys/op/<b>/func/<op> 按算子读。
+// 一个 2 小时的任务配 30 秒心跳超时，检测 worker 死亡只要 30 秒而不是 2 小时。
+var defaultTimeout = 30 * time.Second
 
 // ParamRef 描述一个跨界参数。读参给值（执行器不必自己解 XValue 的 TLV 编码），
 // 写参给绝对路径。二者均经 ‥rparam/‥wparam 零拷贝重定向解析。

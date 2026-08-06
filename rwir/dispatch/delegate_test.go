@@ -8,6 +8,7 @@ package dispatch_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,8 @@ func loadSrc(t *testing.T, kv kvspace.KVSpace, src string) {
 // backend 是测试用的 echo 执行器。seen 记录它见过的全部 taskID。
 type backend struct {
 	seen     []string
+	status   string // 上报给 VM 的完成状态，默认 "done"
+	inst     string // 实例编号，每个用例唯一
 	done     chan struct{}
 	finished chan struct{}
 }
@@ -66,24 +69,35 @@ func (b *backend) stop() {
 	<-b.finished
 }
 
-// startBackend 起一个 echo 执行器：注册能力，然后循环消费命令队列。
-func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) *backend {
+// registerBackend 注册能力与一个 running 实例，返回实例编号。
+//
+// 实例编号每个用例唯一 —— 命令队列 /sys/op/<b>/<n>/cmd 是 Notify 队列，活在
+// kvspace 树外，DelTree 清不掉。用例若留下未被消费的任务（比如超时用例），
+// 固定用 "0" 会让下一个用例的后端把它捞走。
+func registerBackend(t *testing.T, kv kvspace.KVSpace, name, op string) string {
 	t.Helper()
+	instSeq++
+	inst := strconv.Itoa(instSeq)
 	if err := kv.Set([]kvspace.KVPair{
 		{Key: keytree.SysOpFunc(name, op), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysOp(name, inst), Val: kvspace.NewChar(`{"status":"running","load":0}`)},
 	}); err != nil {
 		t.Fatalf("register %s.%s: %v", name, op, err)
 	}
-	if err := kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysOp(name, "0"), Val: kvspace.NewChar(`{"status":"running","load":0}`)},
-	}); err != nil {
-		t.Fatalf("register instance: %v", err)
-	}
+	return inst
+}
 
-	b := &backend{done: make(chan struct{}), finished: make(chan struct{})}
+var instSeq = 0
+
+// startBackend 起一个 echo 执行器：注册能力，然后循环消费命令队列。
+func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) *backend {
+	t.Helper()
+	inst := registerBackend(t, kv, name, op)
+
+	b := &backend{status: "done", inst: inst, done: make(chan struct{}), finished: make(chan struct{})}
 	go func() {
 		defer close(b.finished)
-		queue := keytree.SysOpCmd(name, "0")
+		queue := keytree.SysOpCmd(name, inst)
 		for {
 			select {
 			case <-b.done:
@@ -110,7 +124,7 @@ func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) *backend {
 			}
 			// 状态在先，信号在后 —— VM 收到信号后会复查 .status
 			kv.Set([]kvspace.KVPair{
-				{Key: keytree.SysTask(task.ID, "status"), Val: kvspace.NewChar("done")},
+				{Key: keytree.SysTask(task.ID, "status"), Val: kvspace.NewChar(b.status)},
 			})
 			kv.Notify(task.DoneKey, kvspace.NewChar("1"))
 		}
@@ -141,6 +155,14 @@ func run(t *testing.T, kv kvspace.KVSpace, entry string) string {
 // art:// 是**进程内全局单例** —— Conn 不会给出独立实例，DisConn 也不清空。
 // 不显式清理的话，上一个测试残留的 /lib/main 会串进下一个测试，`go test -shuffle=on`
 // 就会随机失败。必须清根，不能只建索引。
+// vtidBase 保证跨用例的 vtid 单调递增。
+//
+// 清 /vthread 根会连 ‥seq 计数器一起清掉，vtid 于是每个用例都从 1 重来 →
+// taskID 跨用例重复。而 Notify 队列活在 kvspace 树外（__notify: 命名空间），
+// DelTree 删不掉，于是上一个用例遗留的 done 信号会被下一个用例读走。
+// 这不是测试专属的怪癖 —— 任何清空 /vthread 的操作都会踩到，值得记在这里。
+var vtidBase = 1000
+
 func newKV(t *testing.T) kvspace.KVSpace {
 	t.Helper()
 	kv := kvspace.Conn("art://")
@@ -153,6 +175,8 @@ func newKV(t *testing.T) kvspace.KVSpace {
 	}
 	kvspace.MkIndexRecursive(kv, keytree.LibRoot+keytree.PathSegSep)
 	kvspace.MkIndexRecursive(kv, keytree.VthreadRoot+keytree.PathSegSep)
+	vtidBase += 100
+	kv.Set([]kvspace.KVPair{{Key: keytree.VthreadSeq, Val: kvspace.NewChar(strconv.Itoa(vtidBase))}})
 	return kv
 }
 
@@ -352,8 +376,8 @@ main()
 // 不静默回退到某个碰巧也注册了同名算子的后端。
 func TestSelectNamespaceIsBackend(t *testing.T) {
 	kv := newKV(t)
-	startBackend(t, kv, "llm", "complete").stop() // llm 只支持 complete
-	startBackend(t, kv, "other", "chat").stop()   // other 支持 chat
+	registerBackend(t, kv, "llm", "complete") // llm 只支持 complete
+	registerBackend(t, kv, "other", "chat")   // other 支持 chat
 
 	if _, _, err := dispatch.Select(context.Background(), kv, "llm.chat"); err == nil {
 		t.Fatal("llm 不支持 chat 时应报错，而不是把任务投给 other")
@@ -373,10 +397,64 @@ func TestSelectSkipsStoppedInstance(t *testing.T) {
 		{Key: keytree.SysOpFunc("aaa", "echo"), Val: kvspace.NewChar("1")},
 		{Key: keytree.SysOp("aaa", "0"), Val: kvspace.NewChar(`{"status":"stopped","load":0}`)},
 	})
-	startBackend(t, kv, "zzz", "echo").stop()
+	registerBackend(t, kv, "zzz", "echo")
 
 	b, _, err := dispatch.Select(context.Background(), kv, "echo")
 	if err != nil || b != "zzz" {
 		t.Fatalf("应跳过 stopped 的 aaa 选中 zzz，实得 backend=%q err=%v", b, err)
+	}
+}
+
+// runExpectErr 执行 entry 并返回 Execute 的错误（不 Fatal），供失败路径用例使用。
+func runExpectErr(t *testing.T, kv kvspace.KVSpace, entry string) error {
+	t.Helper()
+	vtid := vthread.AllocVtid(kv)
+	kv.DelTree(keytree.VThread(vtid))
+	kvspace.MkIndexRecursive(kv, keytree.VThread(vtid)+keytree.PathSegSep)
+	builtin.WriteSysRwir(kv)
+	pc := layout.Bootstrap(context.Background(), kv, vtid, entry, nil)
+	if pc == "" {
+		t.Fatalf("Bootstrap %s failed", entry)
+	}
+	vthread.Set(context.Background(), kv, vtid, pc, "init")
+	return kvcpu.New(kv, "test").Execute(pc)
+}
+
+const delegateSrc = `
+rwir fake.echo(a:string) -> (b:string)
+
+rwfunc main() -> () {
+	fake.echo("v") -> out
+}
+
+main()
+`
+
+// TestDelegateTimeout 覆盖执行器完全不响应：必须干净报错并写 ‥error/msg，
+// 而不是挂死或误判成功。此前零覆盖——把 Watch 之后的 status 复查删掉测试仍全绿。
+func TestDelegateTimeout(t *testing.T) {
+	defer dispatch.SetTimeoutForTest(150 * time.Millisecond)()
+	kv := newKV(t)
+	registerBackend(t, kv, "fake", "echo") // 注册但不起消费者：任务推进队列后无人处理
+	loadSrc(t, kv, delegateSrc)
+
+	err := runExpectErr(t, kv, "init")
+	if err == nil || !strings.Contains(err.Error(), "timeout or failed") {
+		t.Fatalf("执行器不响应时应超时报错，实得 %v", err)
+	}
+}
+
+// TestDelegateBackendReportsFailed 覆盖执行器主动报失败：VM 必须终止而非继续。
+func TestDelegateBackendReportsFailed(t *testing.T) {
+	defer dispatch.SetTimeoutForTest(2 * time.Second)()
+	kv := newKV(t)
+	be := startBackend(t, kv, "fake", "echo")
+	be.status = "failed"
+	loadSrc(t, kv, delegateSrc)
+
+	err := runExpectErr(t, kv, "init")
+	be.stop()
+	if err == nil || !strings.Contains(err.Error(), `status="failed"`) {
+		t.Fatalf("执行器报 failed 时应终止并带上状态，实得 %v", err)
 	}
 }

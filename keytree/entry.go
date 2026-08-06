@@ -9,6 +9,31 @@ const LibRoot = PathSegSep + PathSegLib
 
 // CheckWriteKey 校验一条写指令的落点，原生与委托两条路共用。
 //
+// # 威胁模型（先看这个，否则会高估它）
+//
+// 三个角色，可信程度不同：
+//
+//	VM 与 kvspace   可信
+//	kvlang 程序     半可信 —— 本项目的目标就是让 agent 写 kvlang 代码
+//	外部执行器      不可信 —— LLM / agent sidecar
+//
+// **本函数是「程序沙箱」，不是「执行器沙箱」。**
+// 它保证：agent 写出的 kvlang 代码，无论走原生写还是走委托，都改不动引擎状态、
+// 改不了运行中的代码、动不了别的 vthread、碰不到 /dev 那个任意文件写的 sink。
+// 这正是自进化场景需要的性质 —— agent 生成的代码进 /lib/gen/ 跑起来无法提权。
+//
+// 它不保证：不守协议的执行器被挡住。任务描述里带着 vtid 与 pc，执行器完全可以
+// 自己推出任何键直接写（它按协议本来就在写 /sys/task/<id>.status）。封死那一侧
+// 要靠 kvspace 的作用域凭证或居中 broker，不是这里。
+//
+// # 为什么只管写不管读
+//
+// 读侧刻意保持开放。委托出去的 agent 能读到指令集（/sys/rwir/）、源码（/lib/）、
+// 活的调用栈、历史 vthread —— 这是 kvlang 相对「LLM SDK 绑定」的全部差异所在，
+// 也是 article/self-evolving-robot.md 里自分析那一步的前提。限制读会直接砍掉
+// 项目的核心论点。代价是程序可以把任意键的值送给执行器；在「程序半可信、
+// 执行器按部署可信」这个模型下这是可接受的，换模型时必须重新评估。
+//
 // 允许：调用方自己的 vthread 子树、用户全局键（不在四个域根下的路径）。
 // 拒绝：
 //   - 非规范路径（空段 / . / ..）—— 纯前缀比较对它们无效，而 kvspace 当前是
@@ -46,6 +71,10 @@ func CheckWriteKey(vtid, key string) error {
 		}
 	}
 	if strings.HasPrefix(key, VthreadRoot+PathSegSep) && !strings.HasPrefix(key, VThread(vtid)+PathSegSep) {
+		if key == VThread(vtid) {
+			// 自己的 vthread 根本身是帧根（目录），当叶子写会毁掉帧
+			return fmt.Errorf("写槽指向本 vthread 的帧根: %q", key)
+		}
 		return fmt.Errorf("写槽越出本 vthread（vtid=%s）: %q", vtid, key)
 	}
 	return nil

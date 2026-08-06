@@ -409,8 +409,10 @@ func (p *parser) parseRwirDecl() ast.RwirDecl {
 	if t := p.peek(); t.Kind == Ident {
 		decl.Sig.Name = t.Value
 		p.advance()
-		// 处理点号命名空间：string.len, tensor.matmul 等
-		if p.peek().Kind == Dot {
+		// 处理点号命名空间：string.len、llm.chat 等。
+		// 用 for 而非 if —— 与 parseFuncSig 保持一致，多段名（a.b.c）才不会
+		// 只吃掉一段就把剩下的留给参数表解析。
+		for p.peek().Kind == Dot {
 			decl.Sig.Name += p.advance().Value // .
 			if p.peek().Kind == Ident {
 				decl.Sig.Name += p.advance().Value
@@ -437,11 +439,19 @@ func (p *parser) parseRwirDecl() ast.RwirDecl {
 // parseFuncSig 消费 rwfunc name(...) -> (...) 签名，直接构造 ast.FuncSig。
 // 不经中间字符串，不需要 tokensToSig。
 func (p *parser) parseFuncSig() ast.FuncSig {
-	p.advance() // consume 'rwfunc'
+	p.advance() // consume 'rwfunc' / 'rwir'
 	var sig ast.FuncSig
 	if t := p.peek(); t.Kind == Ident {
 		sig.Name = t.Value
 		p.advance()
+		// 点号命名空间：rwir 声明的签名名带点（llm.chat），与 parseRwirDecl 对称。
+		// 不处理则 peek 到 Dot 时跳过参数表与返回值，静默产出空签名。
+		for p.peek().Kind == Dot {
+			sig.Name += p.advance().Value
+			if p.peek().Kind == Ident {
+				sig.Name += p.advance().Value
+			}
+		}
 	}
 	if p.peek().Kind == LParen {
 		p.advance()

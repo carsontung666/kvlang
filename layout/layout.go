@@ -132,21 +132,7 @@ func HandleCall(ctx context.Context, kv kvspace.KVSpace, pc string, inst *rwir.R
 	vtid := keytree.VtidFromPC(pc)
 	funcName := inst.Reads[0].Name
 
-	var pkg string
-	libPrefix := keytree.LibRoot + keytree.PathSegSep
-	if strings.HasPrefix(funcName, libPrefix) {
-		rest := funcName[len(libPrefix):]
-		if dot := strings.LastIndex(rest, keytree.MemberSep); dot > 0 {
-			pkg = rest[:dot]
-			funcName = rest[dot+len(keytree.MemberSep):]
-		} else {
-			funcName = rest
-		}
-	} else if dot := strings.LastIndex(funcName, keytree.MemberSep); dot > 0 {
-		pkg = funcName[:dot]
-		funcName = funcName[dot+len(keytree.MemberSep):]
-	}
-	funcKey := keytree.LibFunc(pkg, funcName)
+	funcKey := keytree.FuncKey(funcName)
 
 	sigVal := kvspace.GetOne(kv, funcKey)
 	if kvspace.IsNone(sigVal) {

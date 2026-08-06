@@ -38,9 +38,7 @@ func loadSrc(t *testing.T, kv kvspace.KVSpace, src string) {
 	if parser.HasErrors(diags) {
 		t.Fatalf("parse diagnostics: %v", diags)
 	}
-	for i := range df.RwirDecls {
-		layout.WriteRwir(kv, df.RwirDecls[i].Pkg, &df.RwirDecls[i])
-	}
+	layout.WriteDecls(kv, df)
 	for i := range df.Funcs {
 		layout.WriteFunc(kv, df.Funcs[i].Pkg, lower.Func(&df.Funcs[i]))
 	}
@@ -56,14 +54,12 @@ func loadSrc(t *testing.T, kv kvspace.KVSpace, src string) {
 
 // startBackend 起一个 echo 执行器：注册能力，然后循环消费命令队列。
 // 返回的 stop 关闭后 goroutine 退出。
-func startBackend(t *testing.T, kv kvspace.KVSpace, name string, ops ...string) (stop func()) {
+func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) (stop func()) {
 	t.Helper()
-	for _, op := range ops {
-		if err := kv.Set([]kvspace.KVPair{
-			{Key: keytree.SysOpFunc(name, op), Val: kvspace.NewChar("1")},
-		}); err != nil {
-			t.Fatalf("register %s.%s: %v", name, op, err)
-		}
+	if err := kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysOpFunc(name, op), Val: kvspace.NewChar("1")},
+	}); err != nil {
+		t.Fatalf("register %s.%s: %v", name, op, err)
 	}
 	if err := kv.Set([]kvspace.KVPair{
 		{Key: keytree.SysOp(name, "0"), Val: kvspace.NewChar(`{"status":"running","load":0}`)},
@@ -81,7 +77,7 @@ func startBackend(t *testing.T, kv kvspace.KVSpace, name string, ops ...string) 
 			default:
 			}
 			raw := kv.Watch(queue, 200*time.Millisecond)
-			if kvspace.IsNone(raw) || raw.String() == "" {
+			if raw.String() == "" {
 				continue
 			}
 			var task dispatch.OpTask
@@ -99,8 +95,7 @@ func startBackend(t *testing.T, kv kvspace.KVSpace, name string, ops ...string) 
 			}
 			// 状态在先，信号在后 —— VM 收到信号后会复查 .status
 			kv.Set([]kvspace.KVPair{
-				{Key: keytree.Member(dispatch.TaskRoot+keytree.PathSegSep+task.ID, "status"),
-					Val: kvspace.NewChar("done")},
+				{Key: keytree.SysTask(task.ID, "status"), Val: kvspace.NewChar("done")},
 			})
 			kv.Notify(task.DoneKey, kvspace.NewChar("1"))
 		}
@@ -140,9 +135,6 @@ func newKV(t *testing.T) kvspace.KVSpace {
 
 // TestDelegateWriteParamRedirect 是核心用例：委托指令出现在嵌套 rwfunc 帧内时，
 // 输出必须经 ‥wparam 零拷贝重定向落到**调用方**的槽位。
-//
-// 这正是旧实现错的地方 —— 它用 keytree.VThreadAt 拼到 vthread 根帧，
-// 只在顶层配绝对路径参数时才碰巧正确。
 func TestDelegateWriteParamRedirect(t *testing.T) {
 	kv := newKV(t)
 	defer startBackend(t, kv, "fake", "echo")()
@@ -197,7 +189,6 @@ main()
 }
 
 // TestDelegateNoBackend 确认路由失败会写 vthread 错误状态。
-// 旧实现只把 error 返回给 Execute，run.go 读不到 ‥error/msg → 静默失败且 exit 0。
 func TestDelegateNoBackend(t *testing.T) {
 	kv := newKV(t)
 

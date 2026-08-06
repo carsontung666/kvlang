@@ -10,8 +10,8 @@
 跑法（两个终端）：
     redis-server &
     export KVLANG_KVSPACE=redis://127.0.0.1:6379
-    python3 tutorial/08-delegate/fake_backend.py &
-    ./kvlang tutorial/08-delegate/echo.kv
+    python3 examples/delegate/fake_backend.py &
+    ./kvlang examples/delegate/echo.kv
 
 注意 art:// 下不工作 —— 那是进程内 kvspace，外部进程看不见 /sys/op。
 """

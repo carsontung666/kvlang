@@ -80,13 +80,18 @@ func SetError(ctx context.Context, kv kvspace.KVSpace, vtid, pc, errMsg string) 
 
 // ── 生命周期 ──────────────────────────────────────────────────────────────────
 
-// AllocVtid 原子自增 /vthread/seq 并返回新 vtid。
-func AllocVtid(kv kvspace.KVSpace) string {
-	valV := kvspace.GetOne(kv, keytree.VthreadSeq)
-	n, _ := strconv.ParseInt(valV.String(), 10, 64)
+// NextSeq 自增 key 处的计数器并返回新值。
+// 注意是 Get-then-Set，非原子 —— 两个进程并发调用会拿到同一个值。
+func NextSeq(kv kvspace.KVSpace, key string) int64 {
+	n, _ := strconv.ParseInt(kvspace.GetOne(kv, key).String(), 10, 64)
 	n++
-	kv.Set([]kvspace.KVPair{{keytree.VthreadSeq, kvspace.NewChar(strconv.FormatInt(n, 10))}})
-	return fmt.Sprintf("%d", n)
+	kv.Set([]kvspace.KVPair{{key, kvspace.NewChar(strconv.FormatInt(n, 10))}})
+	return n
+}
+
+// AllocVtid 自增 /vthread/‥seq 并返回新 vtid。
+func AllocVtid(kv kvspace.KVSpace) string {
+	return fmt.Sprintf("%d", NextSeq(kv, keytree.VthreadSeq))
 }
 
 // CreateVThread 在 kvspace 中创建新虚线程，返回 vtid。
@@ -112,18 +117,3 @@ func CreateVThread(kv kvspace.KVSpace, funcName string, reads, writes []string) 
 	return vtid, nil
 }
 
-// ── 等待 ──────────────────────────────────────────────────────────────────────
-
-// WaitDone 阻塞等待 vthread 终态。
-func WaitDone(ctx context.Context, kv kvspace.KVSpace, vtid string, timeout time.Duration) (string, error) {
-	val := kv.Watch(keytree.VThreadStatus(vtid), timeout)
-	signal := val.String()
-	if signal == "" {
-		return "", fmt.Errorf("WaitDone %s: timeout", vtid)
-	}
-	if signal == "error" {
-		msgVal := kvspace.GetOne(kv, keytree.VThreadStatusMsg(vtid, "error"))
-		return "", fmt.Errorf("vthread %s: %s", vtid, msgVal.String())
-	}
-	return signal, nil
-}

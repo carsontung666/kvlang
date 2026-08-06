@@ -316,12 +316,7 @@ func RegisterBlocks(kv kvspace.KVSpace, pkg, parent string, body []ast.Stmt) {
 
 // Bootstrap 为 vthread 的顶层入口函数建立虚线程根帧。
 func Bootstrap(ctx context.Context, kv kvspace.KVSpace, vtid, funcName string, args []string) string {
-	pkg, name := "", funcName
-	if dot := strings.LastIndex(funcName, keytree.MemberSep); dot > 0 {
-		pkg = funcName[:dot]
-		name = funcName[dot+len(keytree.MemberSep):]
-	}
-	funcKey := keytree.LibFunc(pkg, name)
+	funcKey := keytree.FuncKey(funcName)
 
 	vthreadRoot := keytree.VThread(vtid)
 	kvspace.MkIndexRecursive(kv, keytree.Stack(vthreadRoot))
@@ -373,6 +368,18 @@ func countDirectInsts(body []ast.Stmt) int32 {
 		}
 	}
 	return n
+}
+
+// WriteDecls 把一个源文件里的全部 rwir 声明写入 /lib。
+// 声明未指定 lib 归属时落到文件的包名下（与 Funcs 的处理一致）。
+func WriteDecls(kv kvspace.KVSpace, df *ast.File) {
+	for i := range df.RwirDecls {
+		pkg := df.RwirDecls[i].Pkg
+		if pkg == "" {
+			pkg = df.Package
+		}
+		WriteRwir(kv, pkg, &df.RwirDecls[i])
+	}
 }
 
 // WriteRwir 将 rwir 声明写入 /lib/<pkg>/<name>，kind="rwir"，无指令体。

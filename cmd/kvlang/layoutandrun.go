@@ -72,13 +72,7 @@ func runCode(name string, rc io.Reader, dsn string, debug bool) {
 	if err != nil { logx.Fatal("parse: %v", err) }
 	for _, d := range diags { d.SrcName = "<inline>"; logx.Diag(d) }
 	if parser.HasErrors(diags) { logx.Fatal("parse: error-level diagnostics — refusing to execute") }
-	// rwir 声明先注册，再判断有没有可执行代码 —— 只含声明的源文件是合法的
-	// 「接口文件」，注册完安静退出，不去找 init（否则 Bootstrap 失败 exit 1）。
-	for i := range df.RwirDecls {
-		dpkg := df.RwirDecls[i].Pkg
-		if dpkg == "" { dpkg = df.Package }
-		layout.WriteRwir(kv, dpkg, &df.RwirDecls[i])
-	}
+	layout.WriteDecls(kv, df)
 	if len(df.Funcs) == 0 && len(df.TopLevelCalls) == 0 && len(df.InitBody) == 0 { return }
 	for i := range df.Funcs {
 		fpkg := df.Funcs[i].Pkg

@@ -402,6 +402,20 @@ func HasErrors(diags []Diagnostic) bool {
 
 // ── 签名解析 ───────────────────────────────────────────────────
 
+// parseDottedTail 消费名字里的 .seg 后缀并原样返回（含点）。
+// 命名空间名（llm.chat、string.len）在词法上是 Ident Dot Ident，不处理则会在
+// peek 到 Dot 时提前结束名字，跳过参数表与返回值，静默产出空签名。
+func (p *parser) parseDottedTail() string {
+	var tail string
+	for p.peek().Kind == Dot {
+		tail += p.advance().Value
+		if p.peek().Kind == Ident {
+			tail += p.advance().Value
+		}
+	}
+	return tail
+}
+
 // parseRwirDecl 解析 rwir name(...) -> (...) 声明（无体）。
 func (p *parser) parseRwirDecl() ast.RwirDecl {
 	p.advance() // consume 'rwir'
@@ -409,15 +423,7 @@ func (p *parser) parseRwirDecl() ast.RwirDecl {
 	if t := p.peek(); t.Kind == Ident {
 		decl.Sig.Name = t.Value
 		p.advance()
-		// 处理点号命名空间：string.len、llm.chat 等。
-		// 用 for 而非 if —— 与 parseFuncSig 保持一致，多段名（a.b.c）才不会
-		// 只吃掉一段就把剩下的留给参数表解析。
-		for p.peek().Kind == Dot {
-			decl.Sig.Name += p.advance().Value // .
-			if p.peek().Kind == Ident {
-				decl.Sig.Name += p.advance().Value
-			}
-		}
+		decl.Sig.Name += p.parseDottedTail()
 	}
 	if p.peek().Kind == LParen {
 		p.advance()
@@ -444,14 +450,7 @@ func (p *parser) parseFuncSig() ast.FuncSig {
 	if t := p.peek(); t.Kind == Ident {
 		sig.Name = t.Value
 		p.advance()
-		// 点号命名空间：rwir 声明的签名名带点（llm.chat），与 parseRwirDecl 对称。
-		// 不处理则 peek 到 Dot 时跳过参数表与返回值，静默产出空签名。
-		for p.peek().Kind == Dot {
-			sig.Name += p.advance().Value
-			if p.peek().Kind == Ident {
-				sig.Name += p.advance().Value
-			}
-		}
+		sig.Name += p.parseDottedTail()
 	}
 	if p.peek().Kind == LParen {
 		p.advance()

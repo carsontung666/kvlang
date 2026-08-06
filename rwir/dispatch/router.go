@@ -27,27 +27,22 @@ type instInfo struct {
 //  3. kv.List("/sys/op/<backend>")     → 子项，过滤掉 "func"，剩下实例编号 ["0","1",…]
 //  4. 读取各实例 {status, load}，选负载最低的 running 实例
 func Select(ctx context.Context, kv kvspace.KVSpace, opcode string) (backend, n string, err error) {
-	opname := stripVTypePrefix(opcode)
+	ns, opname := splitOp(opcode)
 
-	// 命名空间优先：llm.chat 先找 backend "llm"。
-	// 否则 Select 会扫所有 backend 找第一个注册了 "chat" 的，llm.chat 与 db.chat
-	// 就会互相抢——一有第二个 provider 必然踩。
-	if ns := opNamespace(opcode); ns != "" {
-		if v := kvspace.GetOne(kv, keytree.SysOpFunc(ns, opname)); !kvspace.IsNone(v) {
-			backend = ns
-		}
+	// 命名空间优先：llm.chat 先找 backend "llm"，否则扫描会让 llm.chat 与
+	// db.chat 抢同一个注册名 "chat"，一有第二个 provider 必然踩。
+	if ns != "" && !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(ns, opname))) {
+		backend = ns
 	}
 
-	// 回退：扫全部 backend。List 对目录子项返回带尾斜杠的名字（叶子不带），
-	// /sys/op/<backend> 必为目录，不剥离则拼出 /sys/op/<b>//func/<op>，
-	// kvspace 对双斜杠路径直接 panic。
-	backends := kv.List(keytree.SysOpRoot+keytree.PathSegSep, false)
-	for _, b := range backends {
+	// 回退扫描。List 对目录子项返回带尾斜杠的名字（叶子不带），/sys/op/<backend>
+	// 必为目录，不剥离则拼出 /sys/op/<b>//func/<op>，kvspace 对双斜杠直接 panic。
+	for _, b := range kv.List(keytree.SysOpRoot+keytree.PathSegSep, false) {
 		if backend != "" {
 			break
 		}
 		b = strings.TrimSuffix(b, keytree.PathSegSep)
-		if v := kvspace.GetOne(kv, keytree.SysOpFunc(b, opname)); !kvspace.IsNone(v) {
+		if !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(b, opname))) {
 			backend = b
 		}
 	}
@@ -60,8 +55,8 @@ func Select(ctx context.Context, kv kvspace.KVSpace, opcode string) (backend, n 
 	bestLoad := math.MaxFloat64
 	for _, child := range children {
 		child = strings.TrimSuffix(child, keytree.PathSegSep)
-		if child == "func" {
-			continue // 跳过 /sys/op/<backend>/func/ 子树（List 返回 "func/"，须先剥尾斜杠）
+		if child == keytree.SegFunc {
+			continue // /sys/op/<backend>/func/ 是能力声明子树，不是实例
 		}
 		val := kvspace.GetOne(kv, keytree.SysOp(backend, child))
 		if kvspace.IsNone(val) {
@@ -97,38 +92,14 @@ func IsDelegated(kv kvspace.KVSpace, opcode string) bool {
 	return !kvspace.IsNone(v) && v.Kind() == kvspace.KindRwir
 }
 
-// ListBackends 返回所有已注册 backend 名称（已剥尾斜杠，与 Select 一致）。
-func ListBackends(ctx context.Context, kv kvspace.KVSpace) ([]string, error) {
-	raw := kv.List(keytree.SysOpRoot+keytree.PathSegSep, false)
-	names := make([]string, 0, len(raw))
-	for _, b := range raw {
-		names = append(names, strings.TrimSuffix(b, keytree.PathSegSep))
-	}
-	return names, nil
-}
 
-// BackendSupports 返回 backend 是否支持某 opcode。
-func BackendSupports(ctx context.Context, kv kvspace.KVSpace, backend, opcode string) bool {
-	return !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(backend, stripVTypePrefix(opcode))))
-}
-
-// opNamespace 返回 opcode 的命名空间段（最后一个点之前的部分）。
-// "llm.chat" → "llm"；"a.b.c" → "a.b"；无点则返回 ""。
-//
-// 必须与 keytree.FuncKey 用同一个切分规则（LastIndex），否则同一个 opcode
-// 在「查签名」和「选后端」两处会被拆成不同的名字。
-func opNamespace(opcode string) string {
+// splitOp 拆分 opcode 为命名空间与注册名。
+// "llm.chat" → ("llm","chat")；"a.b.c" → ("a.b","c")；无点 → ("", opcode)。
+// 切分规则必须与 keytree.FuncKey 一致（LastIndex），否则同一个 opcode 在
+// 「查签名」与「选后端」两处会被拆成不同的名字。
+func splitOp(opcode string) (ns, name string) {
 	if dot := strings.LastIndex(opcode, keytree.MemberSep); dot > 0 {
-		return opcode[:dot]
+		return opcode[:dot], opcode[dot+len(keytree.MemberSep):]
 	}
-	return ""
-}
-
-// stripVTypePrefix 剥离命名空间前缀，返回注册名。
-// "llm.chat" → "chat"；"a.b.c" → "c"；无前缀则原样返回。
-func stripVTypePrefix(opcode string) string {
-	if dot := strings.LastIndex(opcode, keytree.MemberSep); dot > 0 {
-		return opcode[dot+len(keytree.MemberSep):]
-	}
-	return opcode
+	return "", opcode
 }

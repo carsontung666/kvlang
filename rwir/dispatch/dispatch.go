@@ -1,168 +1,130 @@
-// Package dispatch 负责算子分发到 /sys/op/<backend>/<n>/cmd。
+// Package dispatch 负责把委托 rwir 派发给外部执行器。
+//
+// 委托 rwir = /lib 下 kind=rwir 的签名键（有签名、无指令体），由 `rwir name(...) -> (...)`
+// 声明产生。执行器在 /sys/op/<backend>/ 注册能力后接管这些算子的求值。
+//
+// # 任务对象
+//
+//	/sys/task/<taskid>.status   pending | done | failed
+//	/sys/task/<taskid>.done     完成信号（Notify 目标，非持久键）
+//
+// 完成信号不能复用 /vthread/<vtid>/‥status：那个键同时表示 vthread 终止，
+// 且 SetDone/SetError 用同一套值词表 —— 执行器按 VM 自己的方式发信号会静默
+// 终止整个 vthread。
 package dispatch
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
-	"kvlang/keytree"
 	"github.com/array2d/kvspace-go"
+	"kvlang/keytree"
 	"kvlang/logx"
 	"kvlang/rwir"
+	"kvlang/rwir/builtin"
 	"kvlang/vthread"
 )
 
+// defaultTimeout 委托调用的兜底超时。
+//
+// 是 var 不是 const —— 测试要覆盖超时路径就必须能调小它，否则每个用例都得等
+// 30 秒，结果就是没人测（把 Watch 之后的 status 复查整段删掉，测试仍会全绿）。
+//
+// TODO(阶段2): 拆成两个，照 Temporal 的做法 —— StartToClose 界定合法时长、
+// HeartbeatTimeout 界定沉默时长，均从 /sys/op/<b>/func/<op> 按算子读。
+// 一个 2 小时的任务配 30 秒心跳超时，检测 worker 死亡只要 30 秒而不是 2 小时。
+var defaultTimeout = 30 * time.Second
+
+// ParamRef 描述一个跨界参数。读参给值（执行器不必自己解 XValue 的 TLV 编码），
+// 写参给绝对路径。二者均经 ‥rparam/‥wparam 零拷贝重定向解析。
 type ParamRef struct {
-	Key     string                 `json:"key"`
-	Dtype   string                 `json:"dtype,omitempty"`
-	Shape   []int                  `json:"shape,omitempty"`
-	Address map[string]interface{} `json:"address,omitempty"`
+	Key   string `json:"key,omitempty"`
+	Value string `json:"value,omitempty"`
 }
 
+// OpTask 是投递给执行器的任务描述。
 type OpTask struct {
-	Vtid    string                 `json:"vtid"`
-	PC      string                 `json:"pc"`
-	Opcode  string                 `json:"opcode"`
-	Inputs  []ParamRef             `json:"inputs"`
-	Outputs []ParamRef             `json:"outputs"`
-	Params  map[string]interface{} `json:"params,omitempty"`
+	ID      string     `json:"id"`
+	Vtid    string     `json:"vtid"`
+	PC      string     `json:"pc"`
+	Opcode  string     `json:"opcode"`
+	Inputs  []ParamRef `json:"inputs"`
+	Outputs []ParamRef `json:"outputs"`
+	DoneKey string     `json:"done_key"`
 }
 
-
-func isAbsolute(param string) bool {
-	return len(param) > 0 && param[0] == '/'
+// buildTask 解析读写槽，构造 OpTask。
+//
+// 走 builtin 的解析函数而非自行拼路径 —— 与 VM 自身完全相同的路径，因此遵守
+// ‥rparam/‥wparam 零拷贝重定向，嵌套 rwfunc 帧内的局部变量也指向真实位置。
+func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) (*OpTask, error) {
+	framePath := keytree.FrameRoot(pc)
+	task := &OpTask{
+		ID:      taskID,
+		Vtid:    vtid,
+		PC:      pc,
+		Opcode:  inst.Opcode,
+		DoneKey: keytree.SysTask(taskID, "done"),
+	}
+	for _, r := range inst.Reads {
+		task.Inputs = append(task.Inputs, ParamRef{Value: builtin.ResolveReadValue(kv, framePath, r).String()})
+	}
+	for _, w := range inst.Writes {
+		key, err := builtin.ResolveWriteKey(kv, framePath, w.Name)
+		if err != nil {
+			return nil, err // 落点校验：一旦 outputs 出了门，写就发生在 VM 之外
+		}
+		task.Outputs = append(task.Outputs, ParamRef{Key: key})
+	}
+	return task, nil
 }
 
-func isNumber(param string) bool {
-	if len(param) == 0 {
-		return false
+// Delegate 把一条委托 rwir 派发给外部执行器并等待完成。
+func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rwir.Rwir) error {
+	fail := func(format string, a ...any) error {
+		msg := "RuntimeError: delegate: " + fmt.Sprintf(format, a...)
+		vthread.SetError(ctx, kv, vtid, pc, msg)
+		return fmt.Errorf("%s", msg)
 	}
-	for _, c := range param {
-		if c >= '0' && c <= '9' || c == '.' || c == 'e' || c == 'E' {
-			continue
-		}
-		return false
-	}
-	return true
-}
 
-func resolveParam(ctx context.Context, kv kvspace.KVSpace, vtid, param string) ParamRef {
-	ref := ParamRef{Key: param}
-	resolvedKey := param
-	if !isAbsolute(param) && !isNumber(param) {
-		// 裸 ident → 本帧局部变量
-		resolvedKey = keytree.VThreadAt(vtid, param)
-	}
-	ref.Key = resolvedKey
-	val := kvspace.GetOne(kv, resolvedKey)
-	var meta map[string]interface{}
-	if json.Unmarshal([]byte(val.String()), &meta) != nil {
-		return ref
-	}
-	if dtype, ok := meta["dtype"].(string); ok {
-		ref.Dtype = dtype
-	}
-	if shapeRaw, ok := meta["shape"].([]interface{}); ok {
-		for _, s := range shapeRaw {
-			if n, ok := s.(float64); ok {
-				ref.Shape = append(ref.Shape, int(n))
-			}
-		}
-	}
-	if addr, ok := meta["address"].(map[string]interface{}); ok {
-		ref.Address = addr
-	}
-	return ref
-}
-
-func isLiteral(s string) bool {
-	if len(s) > 0 && s[0] == '/' {
-		return false
-	}
-	return true
-}
-
-func buildOpTask(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rwir.Rwir) *OpTask {
-	task := &OpTask{Vtid: vtid, PC: pc, Opcode: inst.Opcode, Params: make(map[string]interface{})}
-	switch inst.Opcode {
-	case "save":
-		for i, r := range inst.Reads {
-			if i == 0 {
-				task.Inputs = append(task.Inputs, resolveParam(ctx, kv, vtid, r.Name))
-			} else {
-				task.Params[fmt.Sprintf("arg%d", len(task.Params))] = r.Name
-			}
-		}
-	case "load":
-		for _, r := range inst.Reads {
-			task.Params[fmt.Sprintf("arg%d", len(task.Params))] = r.Name
-		}
-		for _, w := range inst.Writes {
-			task.Outputs = append(task.Outputs, resolveParam(ctx, kv, vtid, w.Name))
-		}
-	case "print":
-		for _, r := range inst.Reads {
-			task.Inputs = append(task.Inputs, resolveParam(ctx, kv, vtid, r.Name))
-		}
-	default:
-		for _, r := range inst.Reads {
-			if isLiteral(r.Name) {
-				task.Params[fmt.Sprintf("arg%d", len(task.Params))] = r.Name
-			} else {
-				task.Inputs = append(task.Inputs, resolveParam(ctx, kv, vtid, r.Name))
-			}
-		}
-		for _, w := range inst.Writes {
-			task.Outputs = append(task.Outputs, resolveParam(ctx, kv, vtid, w.Name))
-		}
-	}
-	return task
-}
-
-
-func parseShapeParam(raw string) []int {
-	raw = strings.Trim(raw, "[] ")
-	if raw == "" {
-		return nil
-	}
-	var shape []int
-	for _, s := range strings.Split(raw, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		var n int
-		fmt.Sscanf(s, "%d", &n)
-		shape = append(shape, n)
-	}
-	return shape
-}
-
-// Compute 分发张量计算指令到 /sys/op/<backend>/<n>/cmd。
-func Compute(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rwir.Rwir) error {
 	backend, n, err := Select(ctx, kv, inst.Opcode)
 	if err != nil {
-		return fmt.Errorf("route: %w", err)
+		return fail("%v", err)
 	}
-	task := buildOpTask(ctx, kv, vtid, pc, inst)
-	cmdQueue := keytree.SysOpCmd(backend, n)
-	taskJSON, _ := json.Marshal(task)
-	if err := kv.Notify(cmdQueue, kvspace.NewBytes(taskJSON)); err != nil {
-		return fmt.Errorf("push task: %w", err)
-	}
-	logx.Debug("[%s] PUSH %s → %s", vtid, inst.Opcode, cmdQueue)
-	vthread.Set(ctx, kv, vtid, pc, "wait")
-	_, err = vthread.WaitDone(ctx, kv, vtid, 30*time.Second)
+
+	// taskID 必须带序号：scope 帧每轮循环复用同一 PC，仅靠 (vtid, pc) 会碰撞，
+	// 叠加持久化的 Notify 队列会让下一轮读走上一轮迟到的完成信号。
+	taskID := fmt.Sprintf("%s-%d", vtid, vthread.NextSeq(kv, keytree.VThreadDelegSeq(vtid)))
+	task, err := buildTask(kv, taskID, vtid, pc, inst)
 	if err != nil {
-		vthread.SetError(ctx, kv, vtid, pc, err.Error())
-		return err
+		return fail("%s: %v", inst.Opcode, err)
 	}
-	logx.Debug("[%s] DONE %s", vtid, inst.Opcode)
+	specJSON, _ := json.Marshal(task) // OpTask 全是 string 字段，不可能失败
+
+	statusKey := keytree.SysTask(taskID, "status")
+	kv.Set([]kvspace.KVPair{{Key: statusKey, Val: kvspace.NewChar("pending")}})
+
+	// NewChar 而非 NewBytes —— 后者给每个元素追加一个 NUL，JSON 尾部带 \x00
+	// 会让执行器的解析器报出完全指不到病因的错。
+	cmdQueue := keytree.SysOpCmd(backend, n)
+	if err := kv.Notify(cmdQueue, kvspace.NewChar(string(specJSON))); err != nil {
+		return fail("push task: %v", err)
+	}
+	logx.Debug("[%s] DELEGATE %s task=%s → %s", vtid, inst.Opcode, taskID, cmdQueue)
+
+	vthread.Set(ctx, kv, vtid, pc, "wait")
+
+	// Watch 返回后仍复查持久 status：接口注释把 Notify 描述成 fire-and-forget，
+	// 实现却是持久队列，依赖实现行为的代码将来会坏。
+	kv.Watch(task.DoneKey, defaultTimeout)
+	if st := kvspace.GetOne(kv, statusKey); st.String() != "done" {
+		return fail("%s: timeout or failed (status=%q)", inst.Opcode, st.String())
+	}
+
+	logx.Debug("[%s] DONE %s task=%s", vtid, inst.Opcode, taskID)
+	kv.Del(statusKey) // 成功即回收；失败路径留着给人查
 	vthread.Set(ctx, kv, vtid, rwir.NextPC(pc), "running")
 	return nil
 }
-
-

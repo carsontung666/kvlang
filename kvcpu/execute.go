@@ -25,9 +25,11 @@ const MaxStackDepth = 256
 // Dispatch 优先级（全静态，无 KV 分类查询）：
 //  1. IsControlOp   — call/return/br/goto 控制流原语
 //  2. IsNativeOp    — +/-/*/print/sqrt 等标量内建算子
-//  3. tensor.*       — tensor 命名空间算子（op/dispatch）
-//  4. default       — 用户定义函数（rewrite as call）
-//     ↓ HandleCall 内查 FuncIdx；未找到 → SetError
+//  3. isCopyOp      — 值复制（a -> b / /abs -> dst）
+//  4. default       — 查 /lib 签名键的 kind：
+//     ↓ kind=rwir   → 委托给外部执行器（dispatch.Delegate）
+//     ↓ kind=rwfunc → 用户定义函数（rewrite as call → HandleCall）
+//     ↓ 不存在      → HandleCall 内 SetError（NameError）
 //
 // 调试支持（内置，无需特殊启动）：
 // agent 在任意时刻通过 kvspace 写入 /vthread/<vtid>/.debugger 即可激活调试模式。
@@ -151,20 +153,26 @@ func (c *cpu) Execute(pc string) error {
 		case builtin.IsNativeOp(inst.Opcode):
 			execErr = builtin.Native(ctx, c.kv, vtid, pc, inst)
 
-		// ── 3. tensor 命名空间算子（op/dispatch）────────────────────────
-		case strings.HasPrefix(inst.Opcode, "tensor."):
-			execErr = dispatch.Compute(ctx, c.kv, vtid, pc, inst)
-
-		// ── 4. 路径/变量复制（ ./x -> dst 或 /abs -> dst 或 a -> b）──────
+		// ── 3. 路径/变量复制（ ./x -> dst 或 /abs -> dst 或 a -> b）──────
 		//    当 opcode 为路径或字面量且有写槽时，视为 copy 操作。
 		//    裸标识符由 Flat() 归一化为 ./ident，此处通过路径检查统一识别。
 		case isCopyOp(inst.Opcode, inst.Writes):
 			execErr = builtin.ExecuteCopy(c.kv, vtid, pc, inst)
 
-		// ── 5. 用户定义函数（default → rewrite as call）─────────────────
-		//    不含 dot、不在任何静态集合 → 必然是用户 func
-		//    HandleCall 负责 FuncIdx 查找；未找到 → SetError
+		// ── 4. 用户定义函数 或 委托 rwir（default）───────────────────────
+		//    不在任何静态集合 → 查 /lib 签名键的 kind：
+		//      rwir   → 有签名无指令体，委托给外部执行器
+		//      rwfunc → 普通用户函数，rewrite as call
+		//    未找到 → HandleCall 内 SetError（NameError）
+		//
+		//    注意必须在此处判断而非 handleControl 内：进入 handleControl 前
+		//    inst.Opcode 已被下面两行改写为 "call"，算子名移到 Reads[0]。
 		default:
+			if dispatch.IsDelegated(c.kv, inst.Opcode) {
+				logx.Debug("[%s] delegate: %s", vtid, inst.Opcode)
+				execErr = dispatch.Delegate(ctx, c.kv, vtid, pc, inst)
+				break
+			}
 			logx.Debug("[%s] user func: %s", vtid, inst.Opcode)
 			inst.Reads = append([]rwir.Param{{Name: inst.Opcode}}, inst.Reads...)
 			inst.Opcode = rwir.OpCall

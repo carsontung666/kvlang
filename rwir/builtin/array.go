@@ -33,7 +33,10 @@ func (arrayOp) Call(f *rwir.Frame) error {
 		return nil
 	}
 	frameRoot := keytree.FrameRoot(f.PC)
-	outKey := writeSlotKey(f.KV, frameRoot, f.Inst.Writes[0].Name)
+	outKey, err := writeSlotKey(f.KV, frameRoot, f.Inst.Writes[0].Name)
+	if err != nil {
+		return writeDenied(f.KV, f.Vtid, f.PC, err)
+	}
 	// 从输入元素推断目标类型：全部同 kind → 同构数组；否则异构
 	targetKind := ""
 	if len(inputs) > 0 {
@@ -217,10 +220,18 @@ func (arraySetOp) Call(f *rwir.Frame) error {
 		funcFrame := funcFrameRoot(f.KV, fp)
 		base := resolveBasePath(f.KV, fp, funcFrame, f.Inst.Reads[0])
 		path := keytree.Member(base, kvKey(inputs[1]))
+		// set(ptr, key, val) 的落点由 base 指针决定，完全来自运行期数据 ——
+		// `set("/lib", "pwned", x)` 就能直写代码区，必须与写槽同样校验。
+		if err := keytree.CheckWriteKey(f.Vtid, path); err != nil {
+			return writeDenied(f.KV, f.Vtid, f.PC, err)
+		}
 		f.KV.Set([]kvspace.KVPair{{path, inputs[2]}})
 		if len(f.Inst.Writes) > 0 && !kvspace.IsNone(inputs[0]) {
 			// 写入 base 本身（值不变），满足 -> base 返回槽
-			outKey := writeSlotKey(f.KV, fp, f.Inst.Writes[0].Name)
+			outKey, err := writeSlotKey(f.KV, fp, f.Inst.Writes[0].Name)
+			if err != nil {
+				return writeDenied(f.KV, f.Vtid, f.PC, err)
+			}
 			f.KV.Set([]kvspace.KVPair{{outKey, inputs[0]}})
 		}
 		vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")
@@ -277,7 +288,10 @@ func (arraySetOp) Call(f *rwir.Frame) error {
 		result = rawDecodeN(k, raw, int32(n))
 	}
 	if len(f.Inst.Writes) > 0 {
-		outKey := writeSlotKey(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		outKey, err := writeSlotKey(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		if err != nil {
+			return writeDenied(f.KV, f.Vtid, f.PC, err)
+		}
 		f.KV.Set([]kvspace.KVPair{{outKey, result}})
 	}
 	vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")

@@ -26,6 +26,7 @@ const (
 	SegMsg      = "msg"      // 终态附加描述
 	SegTerm     = "term"     // 绑定终端名
 	SegSeq      = "seq"      // vtid 自增序列
+	SegDelegSeq = "delegseq" // 委托任务自增序列（每 vthread 一个）
 
 	SegDev  = "dev"  // /dev
 	SegTTY  = "tty"  // /dev/tty
@@ -34,6 +35,7 @@ const (
 	SegRwir = "rwir" // /sys/rwir
 	SegCmd  = "cmd"  // 命令队列
 	SegFunc = "func" // 算子函数定义
+	SegTask = "task" // /sys/task — 委托任务对象
 
 )
 

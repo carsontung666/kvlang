@@ -13,17 +13,6 @@ import (
 	"kvlang/parser"
 )
 
-// cmdLayoutAndRun 先 layout 再 run（fix-039：替代旧 run 机制）。
-func cmdLayoutAndRun(args []string) {
-	if len(args) == 0 {
-		runLib("", "init", false)
-		return
-	}
-	cmdLayout(args)
-	entry := findEntry(defaultKVSpace())
-	runLib("", entry, false)
-}
-
 func findEntry(dsn string) string {
 	kv := kvspace.Conn(dsn)
 	defer kv.DisConn()
@@ -72,6 +61,7 @@ func runCode(name string, rc io.Reader, dsn string, debug bool) {
 	if err != nil { logx.Fatal("parse: %v", err) }
 	for _, d := range diags { d.SrcName = "<inline>"; logx.Diag(d) }
 	if parser.HasErrors(diags) { logx.Fatal("parse: error-level diagnostics — refusing to execute") }
+	layout.WriteDecls(kv, df)
 	if len(df.Funcs) == 0 && len(df.TopLevelCalls) == 0 && len(df.InitBody) == 0 { return }
 	for i := range df.Funcs {
 		fpkg := df.Funcs[i].Pkg

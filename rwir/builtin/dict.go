@@ -20,7 +20,10 @@ func (dictOp) Call(f *rwir.Frame) error {
 	fp := keytree.FrameRoot(f.PC)
 	var pairs []kvspace.KVPair
 	for _, w := range f.Inst.Writes {
-		outKey := writeSlotKey(f.KV, fp, w.Name)
+		outKey, err := writeSlotKey(f.KV, fp, w.Name)
+		if err != nil {
+			return writeDenied(f.KV, f.Vtid, f.PC, err)
+		}
 		pairs = append(pairs, kvspace.KVPair{outKey, kvspace.Dict{}})
 		for i := 0; i+1 < len(inputs); i += 2 {
 			if kvspace.IsNone(inputs[i+1]) { continue }

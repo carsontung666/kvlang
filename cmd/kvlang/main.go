@@ -26,9 +26,6 @@ func main() {
 		case "layout":
 			cmdLayout(args[1:])
 			return
-		case "layoutandrun":
-			cmdLayoutAndRun(args[1:])
-			return
 		case "run":
 			cmdRun(args[1:])
 			return

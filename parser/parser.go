@@ -234,10 +234,14 @@ func (p *parser) parseLibBody(f *ast.File, prefix string) {
 			continue
 		}
 		if p.peek().Kind == Ident && p.peek().Value == "rwir" {
-				decl := p.parseRwirDecl()
-				decl.Pkg = pkg // lib 归属
-				f.RwirDecls = append(f.RwirDecls, decl)
-			} else if p.peek().Kind == Ident && p.peek().Value == "rwfunc" {
+			decl := p.parseRwirDecl()
+			decl.Pkg = pkg // lib 归属
+			f.RwirDecls = append(f.RwirDecls, decl)
+			p.skipNewlines()
+			continue // 缺 continue 会落到下面的 parseStmt，往 init 里塞一条幻影空指令，
+			         // 使 /lib/init/[0,0] 变成空 opcode → vthread 立刻 SetDone("ok")，
+			         // 整个程序静默变成空操作
+		} else if p.peek().Kind == Ident && p.peek().Value == "rwfunc" {
 			fn := p.parseFunc()
 			fn.Pkg = pkg // lib 归属（fix-039）
 			f.Funcs = append(f.Funcs, fn)
@@ -402,20 +406,33 @@ func HasErrors(diags []Diagnostic) bool {
 
 // ── 签名解析 ───────────────────────────────────────────────────
 
+// parseDottedTail 消费名字里的 .seg 后缀并原样返回（含点）。
+// 命名空间名（llm.chat、string.len）在词法上是 Ident Dot Ident，不处理则会在
+// peek 到 Dot 时提前结束名字，跳过参数表与返回值，静默产出空签名。
+func (p *parser) parseDottedTail() string {
+	var tail string
+	for p.peek().Kind == Dot {
+		tail += p.advance().Value
+		if p.peek().Kind == Ident {
+			tail += p.advance().Value
+		}
+	}
+	return tail
+}
+
 // parseRwirDecl 解析 rwir name(...) -> (...) 声明（无体）。
 func (p *parser) parseRwirDecl() ast.RwirDecl {
-	p.advance() // consume 'rwir'
+	kw := p.advance() // consume 'rwir'
 	var decl ast.RwirDecl
 	if t := p.peek(); t.Kind == Ident {
 		decl.Sig.Name = t.Value
 		p.advance()
-		// 处理点号命名空间：string.len, tensor.matmul 等
-		if p.peek().Kind == Dot {
-			decl.Sig.Name += p.advance().Value // .
-			if p.peek().Kind == Ident {
-				decl.Sig.Name += p.advance().Value
-			}
-		}
+		decl.Sig.Name += p.parseDottedTail()
+	} else {
+		// 无名声明必须报错：WriteRwir 会 DelTree(LibFunc(pkg, name))，
+		// 空名 + 空包名 = DelTree("/lib")，静默抹掉整个函数库。
+		p.errors = append(p.errors, Diagnostic{Pos: kw.Pos,
+			Message: "SyntaxError: rwir 声明缺少名字；help: 写成 rwir name(a:t) -> (b:t)"})
 	}
 	if p.peek().Kind == LParen {
 		p.advance()
@@ -437,11 +454,16 @@ func (p *parser) parseRwirDecl() ast.RwirDecl {
 // parseFuncSig 消费 rwfunc name(...) -> (...) 签名，直接构造 ast.FuncSig。
 // 不经中间字符串，不需要 tokensToSig。
 func (p *parser) parseFuncSig() ast.FuncSig {
-	p.advance() // consume 'rwfunc'
+	kw := p.advance() // consume 'rwfunc' / 'rwir'
 	var sig ast.FuncSig
 	if t := p.peek(); t.Kind == Ident {
 		sig.Name = t.Value
 		p.advance()
+		sig.Name += p.parseDottedTail()
+	} else {
+		// 与 parseRwirDecl 同理：无名会让 WriteFunc 的 DelTree 退化成 DelTree("/lib")
+		p.errors = append(p.errors, Diagnostic{Pos: kw.Pos,
+			Message: "SyntaxError: " + kw.Value + " 缺少名字；help: 写成 " + kw.Value + " name(a:t) -> (b:t)"})
 	}
 	if p.peek().Kind == LParen {
 		p.advance()

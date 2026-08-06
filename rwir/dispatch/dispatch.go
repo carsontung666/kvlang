@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/array2d/kvspace-go"
@@ -46,6 +47,44 @@ type OpTask struct {
 	Inputs  []ParamRef `json:"inputs"`
 	Outputs []ParamRef `json:"outputs"`
 	DoneKey string     `json:"done_key"`
+}
+
+// checkWriteKey 校验一个委托写槽的落点。
+//
+// 委托把写权限交到了 VM 之外：执行器拿到 outputs 里的绝对路径就直接写。
+// 而 kvlang 的写参声明本身就是能力声明 —— `rwir f(a) -> (b)` 说的是「只写 b」，
+// 原生 rwir 由 VM 构造性保证，委托 rwir 只能靠这里把关。
+//
+// 允许：调用方自己的 vthread 子树、用户全局键（根下的普通路径）。
+// 拒绝（实测均可被外部执行器利用）：
+//   - 末段以 ‥ 打头的引擎保留键 —— 写 ‥returnpc 可劫持控制流，写非 PC 值直接
+//     让下一轮 Execute 裸 panic；写 ‥ro 可关掉只读参防线
+//   - /lib —— 改写运行中的代码（VM 每次取指都重新从 KV 解码）
+//   - /sys —— 篡改后端注册表、伪造别人的任务状态
+//   - /dev —— device 层会把 detail 当文件路径 os.OpenFile(O_APPEND|O_CREATE)，
+//     或当 WebSocket URL 直连，等于任意文件写与 SSRF
+//   - 别的 vthread 子树
+func checkWriteKey(vtid, key string) error {
+	if key == "" || key[0] != '/' {
+		return fmt.Errorf("写槽不是绝对路径: %q", key)
+	}
+	for _, seg := range strings.Split(key, keytree.PathSegSep) {
+		if strings.HasPrefix(seg, keytree.RuntimeMemberSep) {
+			return fmt.Errorf("写槽指向引擎保留键: %q", key)
+		}
+	}
+	for _, deny := range []string{keytree.LibRoot, keytree.SysRoot, keytree.DevRoot} {
+		if key == deny || strings.HasPrefix(key, deny+keytree.PathSegSep) {
+			return fmt.Errorf("写槽指向受保护域 %s: %q", deny, key)
+		}
+	}
+	if strings.HasPrefix(key, keytree.VthreadRoot+keytree.PathSegSep) {
+		own := keytree.VThread(vtid) + keytree.PathSegSep
+		if !strings.HasPrefix(key, own) {
+			return fmt.Errorf("写槽指向其它 vthread: %q", key)
+		}
+	}
+	return nil
 }
 
 // buildTask 解析读写槽，构造 OpTask。
@@ -87,6 +126,12 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 	// 叠加持久化的 Notify 队列会让下一轮读走上一轮迟到的完成信号。
 	taskID := fmt.Sprintf("%s-%d", vtid, vthread.NextSeq(kv, keytree.VThreadDelegSeq(vtid)))
 	task := buildTask(kv, taskID, vtid, pc, inst)
+	// 派发之前把关：一旦 outputs 出了门，写就发生在 VM 之外。
+	for _, out := range task.Outputs {
+		if err := checkWriteKey(vtid, out.Key); err != nil {
+			return fail("%s: %v", inst.Opcode, err)
+		}
+	}
 	specJSON, _ := json.Marshal(task) // OpTask 全是 string 字段，不可能失败
 
 	statusKey := keytree.SysTask(taskID, "status")

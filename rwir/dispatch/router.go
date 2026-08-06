@@ -29,55 +29,55 @@ type instInfo struct {
 func Select(ctx context.Context, kv kvspace.KVSpace, opcode string) (backend, n string, err error) {
 	ns, opname := splitOp(opcode)
 
-	// 命名空间优先：llm.chat 先找 backend "llm"，否则扫描会让 llm.chat 与
-	// db.chat 抢同一个注册名 "chat"，一有第二个 provider 必然踩。
-	if ns != "" && !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(ns, opname))) {
-		backend = ns
-	}
-
-	// 回退扫描。List 对目录子项返回带尾斜杠的名字（叶子不带），/sys/op/<backend>
-	// 必为目录，不剥离则拼出 /sys/op/<b>//func/<op>，kvspace 对双斜杠直接 panic。
-	for _, b := range kv.List(keytree.SysOpRoot+keytree.PathSegSep, false) {
-		if backend != "" {
-			break
+	// 命名空间即后端名。llm.chat 只找 backend "llm"，找不到就报错 ——
+	// 不静默回退到某个碰巧也注册了 "chat" 的后端（会把任务投给不相干的 provider）。
+	var candidates []string
+	if ns != "" {
+		if !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(ns, opname))) {
+			candidates = []string{ns}
 		}
-		b = strings.TrimSuffix(b, keytree.PathSegSep)
-		if !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(b, opname))) {
-			backend = b
+	} else {
+		// 无命名空间的裸算子：扫全部后端。List 对目录子项返回带尾斜杠的名字，
+		// 不剥离则拼出 /sys/op/<b>//func/<op>，kvspace 对双斜杠直接 panic。
+		for _, b := range kv.List(keytree.SysOpRoot+keytree.PathSegSep, false) {
+			b = strings.TrimSuffix(b, keytree.PathSegSep)
+			if !kvspace.IsNone(kvspace.GetOne(kv, keytree.SysOpFunc(b, opname))) {
+				candidates = append(candidates, b)
+			}
 		}
 	}
-	if backend == "" {
+	if len(candidates) == 0 {
 		return "", "", fmt.Errorf("no backend supports opcode=%s", opcode)
 	}
 
-	children := kv.List(keytree.SysOpRoot + keytree.PathSegSep + backend + keytree.PathSegSep, false)
-
+	// 在**全部候选后端的全部 running 实例**里挑负载最低的。
+	// 先锁定后端再筛实例的话，首个候选恰好没有 running 实例就会硬失败，
+	// 哪怕另一个候选完全可用。
 	bestLoad := math.MaxFloat64
-	for _, child := range children {
-		child = strings.TrimSuffix(child, keytree.PathSegSep)
-		if child == keytree.SegFunc {
-			continue // /sys/op/<backend>/func/ 是能力声明子树，不是实例
-		}
-		val := kvspace.GetOne(kv, keytree.SysOp(backend, child))
-		if kvspace.IsNone(val) {
-			continue
-		}
-		var info instInfo
-		if json.Unmarshal([]byte(val.String()), &info) != nil {
-			logx.Debug("Select: unmarshal %s/%s: invalid", backend, child)
-			continue
-		}
-		if info.Status != "running" {
-			continue
-		}
-		if info.Load < bestLoad {
-			bestLoad = info.Load
-			n = child
+	for _, b := range candidates {
+		for _, child := range kv.List(keytree.SysOpRoot+keytree.PathSegSep+b+keytree.PathSegSep, false) {
+			child = strings.TrimSuffix(child, keytree.PathSegSep)
+			if child == keytree.SegFunc {
+				continue // 能力声明子树，不是实例
+			}
+			val := kvspace.GetOne(kv, keytree.SysOp(b, child))
+			if kvspace.IsNone(val) {
+				continue
+			}
+			var info instInfo
+			if json.Unmarshal([]byte(val.String()), &info) != nil {
+				logx.Debug("Select: unmarshal %s/%s: invalid", b, child)
+				continue
+			}
+			if info.Status != "running" || info.Load >= bestLoad {
+				continue
+			}
+			bestLoad, backend, n = info.Load, b, child
 		}
 	}
 
 	if n == "" {
-		return "", "", fmt.Errorf("no running instance for backend=%s", backend)
+		return "", "", fmt.Errorf("no running instance for opcode=%s (backends=%v)", opcode, candidates)
 	}
 	return backend, n, nil
 }

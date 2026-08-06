@@ -283,3 +283,65 @@ rwfunc plain(a:string) -> (b:string) { a -> b }
 		}
 	}
 }
+
+// TestDelegateRejectsProtectedWriteSlot 覆盖对抗测试实证出的三条劫持路径：
+// 委托的写槽落到引擎保留键（‥returnpc 可劫持控制流、写非 PC 值让 VM 裸 panic）、
+// 落到 /lib（改写运行中的代码）、落到 /dev（device 层会把它当文件路径 open）。
+// 这些必须在派发**之前**被拒 —— 一旦 outputs 出了门，写就发生在 VM 之外。
+func TestDelegateRejectsProtectedWriteSlot(t *testing.T) {
+	for _, tc := range []struct{ name, slot, want string }{
+		{"引擎保留键", "/vthread/1/‥returnpc", "引擎保留键"},
+		{"帧内保留键", "/vthread/1/[0,0]/‥ro", "引擎保留键"},
+		{"运行中的代码", "/lib/main/[1,0]", "受保护域"},
+		{"后端注册表", "/sys/op/evil/0", "受保护域"},
+		{"设备层", "/dev/tty/x/stdout/detail", "受保护域"},
+		{"别的 vthread", "/vthread/999/r", "其它 vthread"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := dispatch.CheckWriteKeyForTest("1", tc.slot); err == nil {
+				t.Fatalf("写槽 %q 应被拒绝", tc.slot)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("错误原因应含 %q，实得 %v", tc.want, err)
+			}
+		})
+	}
+	// 合法落点必须放行：自己帧内的槽位、用户全局键
+	for _, ok := range []string{"/vthread/1/[0,0]/r", "/vthread/1/x", "/n1", "/mydata/x"} {
+		if err := dispatch.CheckWriteKeyForTest("1", ok); err != nil {
+			t.Errorf("合法写槽 %q 被误拒: %v", ok, err)
+		}
+	}
+}
+
+// TestSelectNamespaceIsBackend 确认命名空间即后端名：找不到就报错，
+// 不静默回退到某个碰巧也注册了同名算子的后端。
+func TestSelectNamespaceIsBackend(t *testing.T) {
+	kv := newKV(t)
+	startBackend(t, kv, "llm", "complete").stop() // llm 只支持 complete
+	startBackend(t, kv, "other", "chat").stop()   // other 支持 chat
+
+	if _, _, err := dispatch.Select(context.Background(), kv, "llm.chat"); err == nil {
+		t.Fatal("llm 不支持 chat 时应报错，而不是把任务投给 other")
+	}
+	b, _, err := dispatch.Select(context.Background(), kv, "other.chat")
+	if err != nil || b != "other" {
+		t.Fatalf("other.chat 应选中 other，实得 backend=%q err=%v", b, err)
+	}
+}
+
+// TestSelectSkipsStoppedInstance 确认候选后端的实例不可用时会继续找别的候选，
+// 而不是锁定第一个候选后硬失败。
+func TestSelectSkipsStoppedInstance(t *testing.T) {
+	kv := newKV(t)
+	// aaa 注册了 echo 但实例是 stopped；zzz 注册了 echo 且 running
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysOpFunc("aaa", "echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysOp("aaa", "0"), Val: kvspace.NewChar(`{"status":"stopped","load":0}`)},
+	})
+	startBackend(t, kv, "zzz", "echo").stop()
+
+	b, _, err := dispatch.Select(context.Background(), kv, "echo")
+	if err != nil || b != "zzz" {
+		t.Fatalf("应跳过 stopped 的 aaa 选中 zzz，实得 backend=%q err=%v", b, err)
+	}
+}

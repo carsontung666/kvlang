@@ -1,0 +1,7 @@
+# expected:
+#   PermissionError: 写槽指向受保护域 /lib
+# 写代码区：/lib 下每次取指都重新从 KV 解码，注入立即生效。
+rwfunc main() -> () {
+	1 + 1 -> /lib/pwned
+}
+main()

@@ -1,0 +1,7 @@
+# expected:
+#   PermissionError: 写槽指向受保护域 /sys
+# 写后端注册表：可把委托任务投给伪造的执行器。
+rwfunc main() -> () {
+	[1,2] -> /sys/op/evil
+}
+main()

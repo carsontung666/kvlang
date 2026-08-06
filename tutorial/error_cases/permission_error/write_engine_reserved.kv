@@ -1,0 +1,8 @@
+# expected:
+#   PermissionError: 写槽指向引擎保留键
+# 引擎保留键：清空 ‥ro 即可关掉读参只读公理（kvcpu/execute.go 的
+# checkReadOnlyWrites 里 ro == "" 直接 return nil）。
+rwfunc main() -> () {
+	"" -> /vthread/1/‥ro
+}
+main()

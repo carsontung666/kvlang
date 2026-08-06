@@ -1,0 +1,21 @@
+# 期望输出
+#   42
+#   local=42
+#   global=42
+#
+# string.set 的正常用法。仓库此前没有任何 .kv 用到它，于是 string.go 那个写入点
+# 在语料里零触达 —— 写落点校验接上去之后，那扇门有没有真的接上就没人验得到。
+# 这个用例同时覆盖：写局部变量槽、写用户全局键。
+
+rwfunc main() -> () {
+	string.set(42) -> s
+	println(s)
+
+	string.set(42) -> local
+	println("local=" + local)
+
+	string.set(42) -> /last_string_set
+	println("global=" + /last_string_set)
+}
+
+main()

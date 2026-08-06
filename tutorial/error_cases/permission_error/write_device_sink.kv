@@ -1,0 +1,8 @@
+# expected:
+#   PermissionError: 写槽指向受保护域 /dev
+# 写设备层：device 把值当文件路径 os.OpenFile(O_APPEND|O_CREATE)，
+# 换成 type=websocket 就是 SSRF。这是本组里危害最直接的一条。
+rwfunc main() -> () {
+	string.set("file") -> /dev/tty/kvlangrun/stdout/type
+}
+main()

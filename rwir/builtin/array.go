@@ -33,7 +33,8 @@ func (arrayOp) Call(f *rwir.Frame) error {
 		return nil
 	}
 	frameRoot := keytree.FrameRoot(f.PC)
-	outKey := writeSlotKey(f.KV, frameRoot, f.Inst.Writes[0].Name)
+	outKey, wErr := writeSlotKey(f.KV, frameRoot, f.Inst.Writes[0].Name)
+	if wErr != nil { return denyWrite(f, wErr) }
 	// 从输入元素推断目标类型：全部同 kind → 同构数组；否则异构
 	targetKind := ""
 	if len(inputs) > 0 {
@@ -48,10 +49,10 @@ func (arrayOp) Call(f *rwir.Frame) error {
 	}
 	if targetKind != "" {
 		arr := packTypedArray(targetKind, inputs)
-		f.KV.Set([]kvspace.KVPair{{outKey, arr}})
+		if err := kvSet(f, []kvspace.KVPair{{outKey, arr}}); err != nil { return err }
 	} else {
 		arr := arrayVal(inputs)
-		f.KV.Set([]kvspace.KVPair{{outKey, arr}})
+		if err := kvSet(f, []kvspace.KVPair{{outKey, arr}}); err != nil { return err }
 	}
 	vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")
 	return nil
@@ -216,13 +217,21 @@ func (arraySetOp) Call(f *rwir.Frame) error {
 		fp := keytree.FrameRoot(f.PC)
 		funcFrame := funcFrameRoot(f.KV, fp)
 		base := resolveBasePath(f.KV, fp, funcFrame, f.Inst.Reads[0])
+		// 这条路径不经任何写槽解析函数：base 来自运行期指针、成员名来自运行期
+		// 字符串，直接就 Set。set("/lib/mylib","add","PWN") 就是靠它直写函数
+		// 签名键的——校验必须挂在这里，不能只挂在解析函数上。
+		// 先把成员键与回写槽**都**校验完，再统一写入 —— 否则回写槽被拒时
+		// 成员键已经落盘，拒绝变成半执行（与 ExecuteCopy / dictOp 对齐）。
 		path := keytree.Member(base, kvKey(inputs[1]))
-		f.KV.Set([]kvspace.KVPair{{path, inputs[2]}})
+		if err := checkMemberKey(fp, path); err != nil { return denyWrite(f, err) }
+		pairs := []kvspace.KVPair{{path, inputs[2]}}
 		if len(f.Inst.Writes) > 0 && !kvspace.IsNone(inputs[0]) {
 			// 写入 base 本身（值不变），满足 -> base 返回槽
-			outKey := writeSlotKey(f.KV, fp, f.Inst.Writes[0].Name)
-			f.KV.Set([]kvspace.KVPair{{outKey, inputs[0]}})
+			outKey, err := writeSlotKey(f.KV, fp, f.Inst.Writes[0].Name)
+			if err != nil { return denyWrite(f, err) }
+			pairs = append(pairs, kvspace.KVPair{outKey, inputs[0]})
 		}
+		if err := kvSet(f, pairs); err != nil { return err }
 		vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")
 		return nil
 	}
@@ -277,8 +286,9 @@ func (arraySetOp) Call(f *rwir.Frame) error {
 		result = rawDecodeN(k, raw, int32(n))
 	}
 	if len(f.Inst.Writes) > 0 {
-		outKey := writeSlotKey(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
-		f.KV.Set([]kvspace.KVPair{{outKey, result}})
+		outKey, err := writeSlotKey(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		if err != nil { return denyWrite(f, err) }
+		if err := kvSet(f, []kvspace.KVPair{{outKey, result}}); err != nil { return err }
 	}
 	vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")
 	return nil

@@ -88,8 +88,15 @@ func executeEntry(kv kvspace.KVSpace, entryName string, debug bool) {
 
 	logx.Info("[single] executing %s", firstPC)
 	cpu := kvcpu.New(kv, "single")
-	cpu.Execute(firstPC)
-	reportRunError(kv, vtid)
+	err := cpu.Execute(firstPC)
+	reportRunError(kv, vtid) // 有 ‥error/msg 时打印并 exit 1
+	if err != nil {
+		// Execute 报错、但 ‥error/msg 没写上。最典型的情形是 kvspace 自身出问题：
+		// vthread.SetError 也要靠 kv.Set 才能写，写不进去就没有 msg 可读。
+		// 丢掉这个返回值会让"执行失败"表现为 exit 0 —— 静默失败是最难查的一类。
+		logx.Error("%v", err)
+		os.Exit(1)
+	}
 }
 
 func reportRunError(kv kvspace.KVSpace, vtid string) {

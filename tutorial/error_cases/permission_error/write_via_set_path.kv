@@ -1,0 +1,7 @@
+# expected:
+#   PermissionError: 成员键指向受保护域 /lib
+# set 的路径分支：base 来自运行期字符串，直接 kv.Set，不经任何写槽解析函数。
+rwfunc main() -> () {
+	_ = set("/lib/mylib", "add", "PWN")
+}
+main()

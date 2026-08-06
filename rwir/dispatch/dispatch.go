@@ -70,7 +70,7 @@ type OpTask struct {
 // ‥rparam/‥wparam 零拷贝重定向，嵌套 rwfunc 帧内的局部变量也指向真实位置。
 // 旧实现用 keytree.VThreadAt(vtid, name) 拼到 vthread 根帧，只在顶层帧且配
 // 绝对路径时才碰巧正确。
-func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) *OpTask {
+func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) (*OpTask, error) {
 	framePath := keytree.FrameRoot(pc)
 	task := &OpTask{
 		ID:      taskID,
@@ -83,9 +83,15 @@ func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) *Op
 		task.Inputs = append(task.Inputs, ParamRef{Value: builtin.ResolveReadValue(kv, framePath, r).String()})
 	}
 	for _, w := range inst.Writes {
-		task.Outputs = append(task.Outputs, ParamRef{Key: builtin.ResolveWriteSlot(kv, framePath, w.Name)})
+		key, err := builtin.ResolveWriteSlot(kv, framePath, w.Name)
+		if err != nil {
+			// 落点校验必须在派发**之前**：outputs 一旦随任务出了门，写就发生在
+			// VM 之外，再也拦不住了。
+			return nil, err
+		}
+		task.Outputs = append(task.Outputs, ParamRef{Key: key})
 	}
-	return task
+	return task, nil
 }
 
 // Delegate 把一条委托 rwir 派发给外部执行器并等待完成。
@@ -97,6 +103,14 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 		msg := "RuntimeError: delegate: " + fmt.Sprintf(format, a...)
 		vthread.SetError(ctx, kv, vtid, pc, msg)
 		return fmt.Errorf("%s", msg)
+	}
+	// failAs 原样保留下层的错误类名。仓库按诊断的首个 token 归类
+	// （README 的 Error Cases 一节、tutorial/error_cases/<类名>/ 的目录布局都靠它），
+	// 把 PermissionError 裹进 "RuntimeError: delegate: …" 会让同一个违规在原生写
+	// 与委托写两条路上被归成两类。
+	failAs := func(err error) error {
+		vthread.SetError(ctx, kv, vtid, pc, err.Error())
+		return err
 	}
 
 	// 调用点与声明的读写参个数必须一致。委托调用不经 HandleCall，没人按声明
@@ -131,7 +145,11 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 	// 要真正封死得换成不可复用的 ID（随机数 / 进程实例标识），那会改变
 	// taskID 的可预测性，留给后续决定。
 	taskID := fmt.Sprintf("%s-%d", vtid, vthread.NextSeq(kv, keytree.VThreadDelegSeq(vtid)))
-	task := buildTask(kv, taskID, vtid, pc, inst)
+	task, err := buildTask(kv, taskID, vtid, pc, inst)
+	if err != nil {
+		// 落点校验失败：保留 PermissionError 类名，别改写成 RuntimeError
+		return failAs(err)
+	}
 	specJSON, err := json.Marshal(task)
 	if err != nil {
 		return fail("%s: marshal task: %v", inst.Opcode, err)

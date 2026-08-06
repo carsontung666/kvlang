@@ -742,6 +742,51 @@ main()
 	}
 }
 
+// TestDelegateOutputSlotIsWriteChecked 确认委托的输出槽同样受写落点校验。
+//
+// 这条最要紧：outputs 一旦随任务出了门，写就发生在 VM 之外，再也拦不住。
+// 所以断言的是「执行器一个任务都没收到」——只断言"报了错"的话，把校验挪到
+// 派发之后仍然会绿，而那时任务已经带着 /lib 的写目标出门了。
+func TestDelegateOutputSlotIsWriteChecked(t *testing.T) {
+	for _, tc := range []struct{ name, slot, want string }{
+		{"代码区", "/lib/pwned", "受保护域"},
+		{"后端注册表", "/sys/op/evil/0", "受保护域"},
+		{"设备层", "/dev/tty/x/stdout/detail", "受保护域"},
+		{"别的 vthread", "/vthread/999/stolen", "不在本 vthread 的子树内"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kv := newKV(t)
+			be := startBackend(t, kv, "fake", "echo")
+			loadSrc(t, kv, "rwir fake.echo(a:string) -> (b:string)\n\n"+
+				"rwfunc main() -> () {\n\tfake.echo(\"X\") -> "+tc.slot+"\n}\n\nmain()\n")
+
+			vtid, err := start(t, kv, "init")
+			be.stop()
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("写 %s 应被拒，实得 err=%v", tc.slot, err)
+			}
+			// 错误类名必须原样保留 PermissionError，不能被裹成
+			// "RuntimeError: delegate: …"。仓库按诊断的首个 token 归类
+			// （README 的 Error Cases、tutorial/error_cases/<类名>/ 目录都靠它），
+			// 裹一层会让同一个违规在原生写与委托写两条路上被归成两类。
+			// 只断言"含 受保护域"是不够的 —— 裹层之后那个子串仍然在。
+			if !strings.HasPrefix(err.Error(), "PermissionError") {
+				t.Fatalf("委托侧应原样保留 PermissionError 类名，实得 %v", err)
+			}
+			if v := kvspace.GetOne(kv, tc.slot); !kvspace.IsNone(v) {
+				t.Fatalf("%s 不该被写入，实得 %q", tc.slot, v.String())
+			}
+			if ids := be.taskIDs(); len(ids) != 0 {
+				t.Fatalf("校验必须在派发**之前**发生，执行器不该收到任务，实得 %v", ids)
+			}
+			if msg := kvspace.GetOne(kv, keytree.VThreadStatusMsg(vtid, "error")); !strings.Contains(msg.String(), "PermissionError") {
+				t.Fatalf("‥error/msg 未写入拒绝原因，实得 %q", msg.String())
+			}
+		})
+	}
+}
+
 // ── 判据与路由 ────────────────────────────────────────────────────────────
 
 // TestIsDelegatedDistinguishesKind 确认判据是声明（kind=rwir）而非命名空间前缀，

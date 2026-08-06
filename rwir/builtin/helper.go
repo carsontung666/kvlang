@@ -59,8 +59,11 @@ func readInputs(f *rwir.Frame) []kvspace.XValue {
 // writeResult writes a typed Value to the first write-slot and advances PC.
 func writeResult(f *rwir.Frame, result kvspace.XValue) error {
 	if len(f.Inst.Writes) > 0 {
-		key := resolveWriteSlot(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
-		if err := f.KV.Set([]kvspace.KVPair{{key, result}}); err != nil {
+		key, err := resolveWriteSlot(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		if err != nil {
+			return denyWrite(f, err)
+		}
+		if err := kvSet(f, []kvspace.KVPair{{key, result}}); err != nil {
 			return err
 		}
 	}
@@ -68,31 +71,63 @@ func writeResult(f *rwir.Frame, result kvspace.XValue) error {
 	return nil
 }
 
+// denyWrite 把落点校验失败变成 vthread 的错误终态。
+//
+// 只 return error 是不够的：cmd/kvlang/run.go 的 reportRunError 靠 ‥error/msg
+// 决定退出码，不写它就会变成"拒绝了，但进程 exit 0"——攻击被挡住却看不出来。
+func denyWrite(f *rwir.Frame, err error) error {
+	vthread.SetError(bg, f.KV, f.Vtid, f.PC, err.Error())
+	return err
+}
+
+// kvSet 执行写入，并把 kvspace 的失败也变成 vthread 的错误终态。
+//
+// 本包历来直接丢弃 kv.Set 的返回值（12 个写入点里只有 2 个接），于是 kvspace
+// 的拒绝（值无法无损编解码、目录值类型不符、后端不可达…）表现为"什么都没发生
+// 且 exit 0"。落点校验加进来之后，这类静默失败会掩盖校验自己的 bug ——
+// 分不清"被拒了"和"写了但没落地"。
+//
+// 注意：写落点校验已经挡掉了非规范路径与受保护域，因此目前很难从 kvlang 源码
+// 构造出一条"校验放行但 Set 失败"的路径（art 后端对标量下建子键、深层缺失父目录
+// 都照收）。这里是纵深防御，不是在修一个已复现的 bug。
+func kvSet(f *rwir.Frame, pairs []kvspace.KVPair) error {
+	if err := f.KV.Set(pairs); err != nil {
+		msg := "RuntimeError: 写入失败: " + err.Error()
+		vthread.SetError(bg, f.KV, f.Vtid, f.PC, msg)
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
 // ResolveWriteSlot 返回写槽的绝对 KV key，供 VM 之外的写入方（rwir/dispatch 的
 // 委托任务 outputs）复用。委托必须与原生写走同一条解析路径，否则同一个写槽
-// 在两条路上会落到不同的键 —— 尤其是 ‥wparam 零拷贝重定向。
-func ResolveWriteSlot(kv kvspace.KVSpace, framePath, name string) string {
+// 在两条路上会落到不同的键 —— 尤其是 ‥wparam 零拷贝重定向，以及本函数末尾的
+// 落点校验：委托的 outputs 一旦出了门，写就发生在 VM 之外，拦不住了。
+func ResolveWriteSlot(kv kvspace.KVSpace, framePath, name string) (string, error) {
 	return resolveWriteSlot(kv, framePath, name)
 }
 
-// resolveWriteSlot 返回写槽的绝对 KV key（先查 .wparam 重定向，再处理绝对路径）。
-func resolveWriteSlot(kv kvspace.KVSpace, framePath, name string) string {
-	if isAbsolute(name) { return name }
-	rwRoot := funcFrameRoot(kv, framePath)
-	if r := kvspace.GetOne(kv, keytree.WParam(rwRoot, name)); !kvspace.IsNone(r) {
-		return r.String()
+// resolveWriteSlot 返回写槽的绝对 KV key（先查 ‥wparam 重定向，再处理绝对路径），
+// 并校验最终落点。
+//
+// 校验放在**所有变换之后**：‥wparam 重定向的目标是从 KV 读出来的任意路径，
+// 名字看着人畜无害不代表落点安全。
+func resolveWriteSlot(kv kvspace.KVSpace, framePath, name string) (string, error) {
+	key := name
+	if !isAbsolute(name) {
+		rwRoot := funcFrameRoot(kv, framePath)
+		if r := kvspace.GetOne(kv, keytree.WParam(rwRoot, name)); !kvspace.IsNone(r) {
+			key = r.String()
+		} else {
+			key = keytree.Stack(rwRoot) + name
+		}
 	}
-	return keytree.Stack(rwRoot) + name
+	return key, keytree.CheckWriteKey(keytree.VtidFromPC(framePath), key)
 }
 
 // nextPC advances PC without writing a result.
 func nextPC(f *rwir.Frame) {
 	vthread.Set(bg, f.KV, f.Vtid, rwir.NextPC(f.PC), "running")
-}
-
-// setWrite writes a typed Value to a named slot (先查 .wparam 重定向).
-func setWrite(kv kvspace.KVSpace, framePath, slot string, val kvspace.XValue) error {
-	return kv.Set([]kvspace.KVPair{{resolveWriteSlot(kv, framePath, slot), val}})
 }
 
 // isContainerKind reports whether a kind represents a container/marker type
@@ -136,10 +171,26 @@ func ExecuteCopy(kv kvspace.KVSpace, vtid, pc string, inst *rwir.Rwir) error {
 		return nil
 	}
 	v := resolveReadValue(kv, framePath, inst.Reads[0])
+	// 两趟：先解析并校验**全部**写槽，再统一写入。
+	//
+	// 逐槽校验是必须的（copy 可以有多个写槽，"SRC" -> ok, /lib/x，校验提到循环外
+	// 就漏掉第 2..N 槽）；但"边校验边写"同样不行 —— 第 2 槽被拒时第 1 槽已经落盘，
+	// 拒绝就成了半执行。实测过：`"SRC" -> ok, /lib/slot2` 报 PermissionError 的同时
+	// ok 已经等于 "SRC"。dictOp 本来就是先全校验再一次 Set，这里对齐它。
+	pairs := make([]kvspace.KVPair, 0, len(inst.Writes))
 	for _, w := range inst.Writes {
-		key := resolveWriteSlot(kv, framePath, w.Name)
-		if err := kv.Set([]kvspace.KVPair{{key, v}}); err != nil {
+		key, err := resolveWriteSlot(kv, framePath, w.Name)
+		if err != nil {
+			vthread.SetError(bg, kv, vtid, pc, err.Error())
 			return err
+		}
+		pairs = append(pairs, kvspace.KVPair{key, v})
+	}
+	if len(pairs) > 0 {
+		if err := kv.Set(pairs); err != nil {
+			msg := "RuntimeError: 写入失败: " + err.Error()
+			vthread.SetError(bg, kv, vtid, pc, msg)
+			return fmt.Errorf("%s", msg)
 		}
 	}
 	vthread.Set(bg, kv, vtid, rwir.NextPC(pc), "running")

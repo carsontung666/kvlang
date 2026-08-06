@@ -1,0 +1,7 @@
+# expected:
+#   PermissionError: 写槽指向受保护域 /lib
+# 第 2 个写槽：copy 与 dict 都遍历所有写槽，校验若放在循环外就漏掉这里。
+rwfunc main() -> () {
+	"SRC" -> ok, /lib/copy_slot2
+}
+main()

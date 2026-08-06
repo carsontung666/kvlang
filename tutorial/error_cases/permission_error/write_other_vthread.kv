@@ -1,0 +1,9 @@
+# expected:
+#   PermissionError: 写槽不在本 vthread 的子树内
+# 跨 vthread：直接用绝对路径伸进别人的帧树。
+# （注意别写成 set("/vthread/999/", "stolen", "GOT") —— keytree.Member 拼的是点号，
+#  那样产出的是 /vthread/999/.stolen 这个兄弟标量键，根本进不了 999 的子树。）
+rwfunc main() -> () {
+	"GOT" -> /vthread/999/stolen
+}
+main()

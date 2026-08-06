@@ -30,8 +30,9 @@ func (strOp) Call(f *rwir.Frame) error {
 	val := ""
 	if len(inputs) > 0 { val = display(inputs[0]) }
 	if len(f.Inst.Writes) > 0 {
-		wKey := writeSlotKey(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
-		f.KV.Set([]kvspace.KVPair{{wKey, kvspace.NewChar(val)}})
+		wKey, err := writeSlotKey(f.KV, keytree.FrameRoot(f.PC), f.Inst.Writes[0].Name)
+		if err != nil { return denyWrite(f, err) }
+		if err := kvSet(f, []kvspace.KVPair{{wKey, kvspace.NewChar(val)}}); err != nil { return err }
 	}
 	logx.Debug("[%s] string.set %q -> %s", f.Vtid, val, f.Inst.Writes)
 	nextPC(f)

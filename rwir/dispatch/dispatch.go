@@ -46,15 +46,13 @@ const TaskRoot = keytree.PathSegSep + "sys" + keytree.PathSegSep + "task"
 
 // ParamRef 描述一个跨界参数。
 //
-//	Name  槽位在源码里的写法（`x`、`/abs/path`、字面量）。仅供诊断。
-//	Key   绝对 kvspace 路径，执行器可直接读/写。读参若是字面量则为空。
-//	Value 读参的当前值，由 VM 解析好 —— 执行器不必自己解 XValue 的 TLV 编码。
-//	      写参不带 Value（还没算出来）。
+//	Key   绝对 kvspace 路径，执行器可直接读/写；读参是字面量时为空。
+//	Value 读参的当前值，VM 已解析好，执行器不必自己解 XValue 的 TLV 编码。
+//	      写参不带 Value。
 //
-// Key 与 Value 都经 ‥rparam/‥wparam 零拷贝重定向解析，所以嵌套 rwfunc 帧内的
-// 局部变量也指向真实位置。
+// 二者均经 ‥rparam/‥wparam 零拷贝重定向解析，嵌套 rwfunc 帧内的局部变量
+// 也指向真实位置。
 type ParamRef struct {
-	Name  string `json:"name"`
 	Key   string `json:"key,omitempty"`
 	Value string `json:"value,omitempty"`
 }
@@ -88,20 +86,9 @@ func nextDelegSeq(kv kvspace.KVSpace, vtid string) int64 {
 	return n
 }
 
-func makeTaskID(kv kvspace.KVSpace, vtid string) string {
-	return fmt.Sprintf("%s-%d", vtid, nextDelegSeq(kv, vtid))
-}
-
-// taskFields 返回一个任务对象的全部成员键。
-// 点号键族没有目录，DelTree 抓不到这些兄弟键，清理必须逐个 Del。
-func taskFields(taskID string) []string {
-	segs := []string{"status", "opcode", "vtid", "pc", "spec", "done"}
-	keys := make([]string, 0, len(segs))
-	for _, s := range segs {
-		keys = append(keys, taskField(taskID, s))
-	}
-	return keys
-}
+// taskSegs 是任务对象的全部成员名。点号键族没有目录，DelTree 抓不到这些
+// 兄弟键，回收必须逐个 Del。
+var taskSegs = []string{"status", "opcode", "vtid", "pc", "spec", "done"}
 
 // buildTask 解析读写槽，构造 OpTask。
 //
@@ -120,16 +107,12 @@ func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) *Op
 	}
 	for _, r := range inst.Reads {
 		task.Inputs = append(task.Inputs, ParamRef{
-			Name:  r.Name,
 			Key:   builtin.ResolveReadKey(kv, framePath, r),
 			Value: builtin.ResolveReadValue(kv, framePath, r).String(),
 		})
 	}
 	for _, w := range inst.Writes {
-		task.Outputs = append(task.Outputs, ParamRef{
-			Name: w.Name,
-			Key:  builtin.ResolveWriteKey(kv, framePath, w.Name),
-		})
+		task.Outputs = append(task.Outputs, ParamRef{Key: builtin.ResolveWriteKey(kv, framePath, w.Name)})
 	}
 	return task
 }
@@ -158,7 +141,7 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 		return fmt.Errorf("%s", msg)
 	}
 
-	taskID := makeTaskID(kv, vtid)
+	taskID := fmt.Sprintf("%s-%d", vtid, nextDelegSeq(kv, vtid))
 	task := buildTask(kv, taskID, vtid, pc, inst)
 	specJSON, err := json.Marshal(task)
 	if err != nil {
@@ -202,12 +185,9 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 
 	logx.Debug("[%s] DONE %s task=%s", vtid, inst.Opcode, taskID)
 
-	// 成功路径回收任务对象：结果已写进调用方的写槽，任务对象本身没有留存价值。
-	// 失败路径**不**回收 —— 留着给人查。
-	// TODO(阶段5): 加 durable await 后，回收要挪到 resumer 里，因为那时
-	// 完成与恢复可能发生在不同进程。
-	for _, k := range taskFields(taskID) {
-		kv.Del(k)
+	// 成功路径回收任务对象（失败路径不回收，留着给人查）。
+	for _, s := range taskSegs {
+		kv.Del(taskField(taskID, s))
 	}
 
 	vthread.Set(ctx, kv, vtid, rwir.NextPC(pc), "running")

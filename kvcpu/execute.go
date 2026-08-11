@@ -22,14 +22,15 @@ const MaxStackDepth = 256
 
 // Execute 从绝对 PC 开始执行 vthread，直到完成、出错或 ctx 取消。
 //
-// Dispatch 优先级（全静态，无 KV 分类查询）：
-//  1. IsControlOp   — call/return/br/goto 控制流原语
-//  2. IsNativeOp    — +/-/*/print/sqrt 等标量内建算子
-//  3. isCopyOp      — 值复制（a -> b / /abs -> dst）
-//  4. default       — 查 /lib 签名键的 kind：
-//     ↓ kind=rwir   → 委托给外部执行器（dispatch.Delegate）
-//     ↓ kind=rwfunc → 用户定义函数（rewrite as call → HandleCall）
-//     ↓ 不存在      → HandleCall 内 SetError（NameError）
+// Dispatch 优先级。前三条是 VM 原语，**必须**排在委托之前 —— 注册表由外部进程
+// 自由写入，让它能夺走控制流 / 内建 / 赋值等同于把整个语言的语义交出去。
+//
+//  1. IsControlOp    — call/return/br/goto 控制流原语（静态集合）
+//  2. IsNativeOp     — +/-/*/print/sqrt 等标量内建算子（静态 map）
+//  3. isCopyOp       — 值复制（a -> b / /abs -> dst）
+//  4. IsDelegatedOp  — 有在岗后端在 /sys/rwir-backend/ 声明该 opcode → 委托出去
+//  5. default        — 用户定义函数（rewrite as call → HandleCall）；
+//     /lib 里没有则 HandleCall 内 SetError（NameError）
 //
 // 调试支持（内置，无需特殊启动）：
 // agent 在任意时刻通过 kvspace 写入 /vthread/<vtid>/.debugger 即可激活调试模式。
@@ -156,24 +157,30 @@ func (c *cpu) Execute(pc string) error {
 		// ── 3. 路径/变量复制（ ./x -> dst 或 /abs -> dst 或 a -> b）──────
 		//    当 opcode 为路径或字面量且有写槽时，视为 copy 操作。
 		//    裸标识符由 Flat() 归一化为 ./ident，此处通过路径检查统一识别。
+		//
+		//    **刻意排在委托之前，与设计文档 04 的顺序相反**。文档把委托放第 3、
+		//    copy 放第 5，那样一个注册了 opcode "=" 的后端就能接管程序里的每一次
+		//    赋值：它拿到被赋的值和写槽绝对路径，写什么变量就是什么。赋值是 VM
+		//    原语，和 IsControlOp / IsNativeOp 同类，不该可被注册表夺走。
+		//    副带好处：纯赋值指令不再需要扫注册表（redis:// 下每条省 1+N 个 RTT）。
 		case isCopyOp(inst.Opcode, inst.Writes):
 			execErr = builtin.ExecuteCopy(c.kv, vtid, pc, inst)
 
-		// ── 4. 委托 rwir 或 用户定义函数（default）──────────────────────
-		//    不在任何静态集合 → 查 /lib 签名键的 kind：
-		//      rwir   → 有签名无指令体，委托给外部执行器
-		//      rwfunc → 普通用户函数，rewrite as call
-		//      不存在 → HandleCall 内 SetError（NameError）
+		// ── 4. 委托：有在岗后端在 /sys/rwir-backend/ 声明了这个 opcode ────
+		//    判据是运行时注册表，不是源码声明，所以后端上下线会改变同一段
+		//    程序的执行去向。排在前三条之后 —— 控制流、内建、赋值这三类 VM
+		//    原语永远赢过后端注册；排在 default 之前 —— 注册会盖过 /lib 里的
+		//    同名 rwfunc。
 		//
-		//    委托判断必须在此处，不能挪进 handleControl：下面两行会把
-		//    inst.Opcode 改写成 "call" 并把算子名移到 Reads[0]，那之后
-		//    Select 拿到的就是字符串 "call" 而不是算子名。
+		//    必须在 default 之前判：下面两行会把 inst.Opcode 改写成 "call"
+		//    并把算子名移到 Reads[0]，那之后 Select 拿到的就是字符串 "call"。
+		case dispatch.IsDelegatedOp(c.kv, inst.Opcode):
+			logx.Debug("[%s] delegate: %s", vtid, inst.Opcode)
+			execErr = dispatch.Delegate(ctx, c.kv, vtid, pc, inst)
+
+		// ── 5. 用户定义函数（default）────────────────────────────────────
+		//    rewrite as call → HandleCall；/lib 里没有则 SetError（NameError）
 		default:
-			if dispatch.IsDelegated(c.kv, inst.Opcode) {
-				logx.Debug("[%s] delegate: %s", vtid, inst.Opcode)
-				execErr = dispatch.Delegate(ctx, c.kv, vtid, pc, inst)
-				break
-			}
 			logx.Debug("[%s] user func: %s", vtid, inst.Opcode)
 			inst.Reads = append([]rwir.Param{{Name: inst.Opcode}}, inst.Reads...)
 			inst.Opcode = rwir.OpCall

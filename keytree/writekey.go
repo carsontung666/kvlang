@@ -48,7 +48,15 @@ import (
 //   - /sys —— 篡改后端注册表、伪造委托任务状态
 //   - /dev —— device 层把值当文件路径 os.OpenFile(O_APPEND|O_CREATE) 或当
 //     WebSocket URL 直连，等于任意文件写与 SSRF
-//   - 四个域根本身，以及别的 vthread 子树
+//   - /done —— 委托完成信号所在的命名空间，整域归引擎。
+//     **注意这条是纵深防御，不是在堵一个已知漏洞。** 直觉上「程序写
+//     /done/rwir/<id> 就能伪造一次已完成」，实测**不成立**：Notify 队列活在
+//     kvspace 树之外（art 是独立的 queues map，redis 是 notifyPrefix 的
+//     LPUSH/BLPOP），Set 从不入队 —— 写完 Get 得到值，而 Watch 同一个键会等满
+//     超时。就算真能唤醒，Delegate 醒来还要复查持久 /sys/task/<id>.status
+//     （/sys 已封死）和输出槽非空，而输出槽在 Notify 之前刚被 Del 过。
+//     封它的理由是：这是引擎的信号命名空间，程序往里写树键没有任何正当用途。
+//   - 域根本身，以及别的 vthread 子树
 //   - 自己 vthread 的根：它是帧根（目录），当叶子写会毁掉帧结构
 //
 // 注意前缀比较一律带上分隔符：`set("/lib","pwned","X")` 产出的是
@@ -95,6 +103,20 @@ import (
 // /sys/heap/robot/weights_v{n} 与 /sys/heap/robot/replay。本规则把 /sys 整域
 // 封死，那条路会被挡住。该能力目前标注为未支持，所以现在不冲突；等 heap 落地时
 // 需要在这里为 /sys/heap 开一个口子（并想清楚它与"程序半可信"的关系）。
+// ValidSegment 报告 s 能否原样当作一个路径段拼进 KV 路径。
+//
+// **把程序可控的字符串拼进路径之前必须过这一关。** kvspace 的 art 后端对非规范
+// 路径是 panic 而非返回错误（art/backend.go 的 mustValidDirPath），而 kvlang 全仓
+// 零处 recover —— 一个含 / 的 opcode 会带着 Go 栈打死整个 VM。
+//
+// 实测触发：仓库自带的 tutorial/06-lib/cross/inline.kv 用 `/lib/math.sum(3,4) -> s`
+// 这种绝对路径调用形态，opcode 即 "/lib/math.sum"；委托判据拿它去拼
+// /sys/rwir-backend/<b>/op/<opcode> 就得到双斜杠。redis 后端不校验路径，所以
+// 这个 bug 只在 art:// 且注册表非空时现形 —— 两个条件缺一都看不到。
+func ValidSegment(s string) bool {
+	return s != "" && s != MemberSep && s != MemberSep+MemberSep && !strings.Contains(s, PathSegSep)
+}
+
 func CheckWriteKey(vtid, key string) error {
 	if key == "" || key[0] != PathSegSep[0] {
 		return fmt.Errorf("PermissionError: 写槽不是绝对路径: %q; help: 写槽必须解析成 / 开头的规范路径", key)
@@ -108,12 +130,12 @@ func CheckWriteKey(vtid, key string) error {
 				key, RuntimeMemberSep)
 		}
 	}
-	for _, root := range []string{LibRoot, SysRoot, DevRoot, VthreadRoot} {
+	for _, root := range []string{LibRoot, SysRoot, DevRoot, DoneRoot, VthreadRoot} {
 		if key == root {
 			return fmt.Errorf("PermissionError: 写槽指向域根 %s: %q; help: 域根是目录，不能当叶子写", root, key)
 		}
 	}
-	for _, root := range []string{LibRoot, SysRoot, DevRoot} {
+	for _, root := range []string{LibRoot, SysRoot, DevRoot, DoneRoot} {
 		if strings.HasPrefix(key, root+PathSegSep) {
 			return fmt.Errorf("PermissionError: 写槽指向受保护域 %s: %q; help: %s 归 VM 所有；请写自己 vthread 的槽位或用户全局键",
 				root, key, root)

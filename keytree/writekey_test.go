@@ -44,9 +44,14 @@ func TestCheckWriteKeyDenies(t *testing.T) {
 		// 受保护域
 		{"代码区", "/lib/pwned", "受保护域"},
 		{"代码区深层", "/lib/mylib.add", "受保护域"},
-		{"后端注册表", "/sys/op/evil/0", "受保护域"},
+		{"后端注册表(旧路径)", "/sys/op/evil/0", "受保护域"},
+		{"后端注册表", "/sys/rwir-backend/evil/op/llm.chat", "受保护域"},
 		{"委托任务对象", "/sys/task/1-1.status", "受保护域"},
 		{"设备层", "/dev/tty/kvlangrun/stdout/detail", "受保护域"},
+		// /done 是委托完成信号所在的命名空间，整域归引擎。纵深防御：树键写进去
+		// 唤不醒任何 Watch（Notify 队列在树外），但程序往这里写没有正当用途。
+		{"完成信号", "/done/rwir/rwir:fake:1:1", "受保护域"},
+		{"完成信号域根", "/done", "域根"},
 
 		// 域根本身
 		{"域根 /lib", "/lib", "域根"},

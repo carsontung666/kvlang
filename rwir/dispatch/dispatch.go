@@ -1,21 +1,31 @@
-// Package dispatch 负责把委托 rwir 派发给外部执行器。
+// Package dispatch 负责把 rwir 指令派发给外部执行器。
 //
-// 委托 rwir = /lib 下 kind=rwir 的签名键（有签名、无指令体），由源码里的
-// `rwir name(...) -> (...)` 声明产生。执行器在 /sys/op/<backend>/ 注册能力后
-// 接管这些算子的求值，调用点形态与普通 rwfunc 完全一致。
+// **判据是后端注册表**（/sys/rwir-backend/<b>/op/<opcode>），不是源码里的声明 ——
+// 见 IsDelegatedOp。源码里的 `rwir name(...) -> (...)` 只贡献一个可选的参数个数
+// 契约，不决定要不要委托。调用点形态与普通 rwfunc 完全一致。
 //
 // # 任务对象
 //
-//	/sys/task/<taskid>.status   pending | done | failed（持久键）
-//	/sys/task/<taskid>.done     完成信号（Notify 目标，非持久键）
+//	/sys/task/<request_id>.status   pending | done | failed（持久键）
+//	/done/rwir/<request_id>         完成信号（Notify 目标，一次性）
 //
 // 完成信号不复用 /vthread/<vtid>/‥status：那个键同时表示 vthread 终止，
 // 且 SetDone/SetError 用同一套值词表 —— 执行器按 VM 自己的方式发一次信号，
 // 就会把整个 vthread 静默终止掉。
 //
+// 持久 status 键是本实现在协议之外补的一层，设计文档里没有。它的作用是
+// **VM 侧判成功**：完成信号是一次性 Notify，只负责唤醒；到底算不算成功由这个
+// 持久键 + 输出槽非空共同判定，所以信号丢失不会被误判成功。
+//
+// 它**不**解决后端侧的幂等。文档 04 一边说完成信号"kvcpu 消费即消失"，一边又
+// 让后端崩溃恢复时"检查 /done/rwir/<id> 是否存在"来去重 —— 已被消费的一次性
+// 信号永远不存在，那条去重永远失效。而本键在成功路径上会被回收（见文末 Del），
+// 同样不能拿来去重。**幂等目前是缺的**，需要 owner 定方案（候选：成功后保留
+// status 键并加 TTL，或让完成信号落成持久键）。
+//
 // # 协议顺序
 //
-// 执行器必须**先写 outputs、再置 .status，最后才 Notify .done**。
+// 执行器必须**先写 outputs、再置 .status，最后才 Notify 完成信号**。
 // VM 侧 Watch 返回后会复查 .status，信号丢失不会被误判成功；反过来若先发信号
 // 后写值，VM 可能在值落地前就继续执行。
 package dispatch
@@ -41,7 +51,8 @@ import (
 // 照样全绿）。SetTimeoutForTest 是唯一的改写入口。
 //
 // TODO: 拆成两个，照 Temporal 的做法 —— StartToClose 界定合法总时长、
-// HeartbeatTimeout 界定沉默时长，均从 /sys/op/<b>/func/<op> 按算子读。
+// HeartbeatTimeout 界定沉默时长。文档 02 要求按 category 分档
+// （compute 30s / api 120s / agent 300s），读 /sys/rwir-backend/<b>/category/。
 // 一个 2 小时的任务配 30 秒心跳超时，检测 worker 死亡只要 30 秒而不是 2 小时。
 var defaultTimeout = 30 * time.Second
 
@@ -53,7 +64,7 @@ type ParamRef struct {
 	Value string `json:"value,omitempty"`
 }
 
-// OpTask 是投递给执行器的任务描述，JSON 编码后推进 /sys/op/<b>/<n>/cmd。
+// OpTask 是投递给执行器的任务描述，JSON 编码后推进 /sys/rwir-backend/<b>/cmd。
 type OpTask struct {
 	ID      string     `json:"id"`
 	Vtid    string     `json:"vtid"`
@@ -77,7 +88,7 @@ func buildTask(kv kvspace.KVSpace, taskID, vtid, pc string, inst *rwir.Rwir) (*O
 		Vtid:    vtid,
 		PC:      pc,
 		Opcode:  inst.Opcode,
-		DoneKey: keytree.SysTask(taskID, "done"),
+		DoneKey: keytree.DoneRwir(taskID),
 	}
 	for _, r := range inst.Reads {
 		task.Inputs = append(task.Inputs, ParamRef{Value: builtin.ResolveReadValue(kv, framePath, r).String()})
@@ -127,7 +138,7 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 		}
 	}
 
-	backend, n, err := Select(ctx, kv, inst.Opcode)
+	backend, err := Select(ctx, kv, inst.Opcode)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -144,7 +155,7 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 	//     清零，于是新一轮从头编号，可能复用上一轮遗留任务的 ID。
 	// 要真正封死得换成不可复用的 ID（随机数 / 进程实例标识），那会改变
 	// taskID 的可预测性，留给后续决定。
-	taskID := fmt.Sprintf("%s-%d", vtid, vthread.NextSeq(kv, keytree.VThreadDelegSeq(vtid)))
+	taskID := fmt.Sprintf("rwir:%s:%s:%d", backend, vtid, vthread.NextSeq(kv, keytree.VThreadDelegSeq(vtid)))
 	task, err := buildTask(kv, taskID, vtid, pc, inst)
 	if err != nil {
 		// 落点校验失败：保留 PermissionError 类名，别改写成 RuntimeError
@@ -170,7 +181,7 @@ func Delegate(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, inst *rw
 
 	// NewChar 而非 NewBytes —— NewBytes 给每个元素追加一个 NUL，JSON 尾部带
 	// \x00 会让执行器的解析器报出完全指不到病因的错。
-	cmdQueue := keytree.SysOpCmd(backend, n)
+	cmdQueue := keytree.SysRwirBackendCmd(backend)
 	if err := kv.Notify(cmdQueue, kvspace.NewChar(string(specJSON))); err != nil {
 		return fail("push task: %v", err)
 	}

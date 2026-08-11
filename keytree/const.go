@@ -37,6 +37,10 @@ const (
 	SegFunc = "func" // 算子函数定义
 	SegTask = "task" // /sys/task — 委托任务对象
 
+	SegRwirBackend = "rwir-backend" // /sys/rwir-backend — 委托后端注册表
+	SegLoad        = "load"         // 后端自报负载
+	SegDone        = "done"         // /done — 完成信号根
+
 )
 
 var (

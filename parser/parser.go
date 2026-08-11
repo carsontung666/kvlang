@@ -412,7 +412,7 @@ func HasErrors(diags []Diagnostic) bool {
 //
 // 点后面必须跟标识符。少了这道检查，`rwir fake.(a:string) -> (b:string)` 会
 // 一路解析通过、无诊断，并写出名字为 "fake." 的畸形键 /lib/fake. ——
-// 它既不可能被任何调用点命中，也不可能被路由（splitOp 会切出空算子名）。
+// 它既不可能被任何调用点命中，也不可能被路由（空算子名不会有后端注册）。
 func (p *parser) parseDottedTail() string {
 	var tail string
 	for p.peek().Kind == Dot {

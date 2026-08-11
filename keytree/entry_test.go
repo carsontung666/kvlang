@@ -19,7 +19,7 @@ func TestSysTask(t *testing.T) {
 }
 
 // TestFuncKey 钉住调用点算子名 → /lib 签名键的映射。
-// layout.HandleCall / layout.Bootstrap / dispatch.IsDelegated 三处共用它，
+// layout.HandleCall / layout.Bootstrap / dispatch.delegatedSig 三处共用它，
 // 任何一处对不上都会变成"函数明明装载了却报 NameError"。
 func TestFuncKey(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{

@@ -19,6 +19,8 @@ func handleControl(ctx context.Context, kv kvspace.KVSpace, vtid, pc string, ins
 	case rwir.OpCall:
 		substackPC := layout.HandleCall(ctx, kv, pc, inst)
 		if substackPC == "" {
+			// 具体诊断由 HandleCall 写进 ‥error/msg（找不到签名 / 参数名重复 /
+			// 声明为 rwir 但无后端 / overlay 失败），这里只负责终止。
 			return fmt.Errorf("call %s failed", inst.Reads[0].Name)
 		}
 		vthread.Set(ctx, kv, vtid, substackPC, "running")

@@ -50,7 +50,10 @@ func newKV(t *testing.T) kvspace.KVSpace {
 	if kv == nil {
 		t.Fatal("Conn(art://) 返回 nil")
 	}
-	for _, root := range []string{keytree.LibRoot, keytree.VthreadRoot, keytree.SysOpRoot, keytree.SysTaskRoot} {
+	for _, root := range []string{
+		keytree.LibRoot, keytree.VthreadRoot,
+		keytree.SysOpRoot, keytree.SysTaskRoot, keytree.SysRwirBackendRoot,
+	} {
 		kv.DelTree(root)
 	}
 	kvspace.MkIndexRecursive(kv, keytree.LibRoot+keytree.PathSegSep)
@@ -133,7 +136,7 @@ type backend struct {
 	seen     []dispatch.OpTask // 解析后的任务，按收到顺序
 	raw      []string          // 队列里的原始 JSON 字符串，用于钉住线协议
 	cfg      backendCfg
-	inst     string
+	name     string // 唯一后端名（registerBackend 生成）
 	done     chan struct{}
 	finished chan struct{}
 }
@@ -158,41 +161,44 @@ func (b *backend) stop() {
 	<-b.finished
 }
 
-// instSeq 让每个用例的实例编号唯一。命令队列 /sys/op/<b>/<n>/cmd 是 Notify
-// 队列，活在 kvspace 树外，DelTree 清不掉。用例若留下未被消费的任务（比如
-// 超时用例），固定用 "0" 会让下一个用例的执行器把它捞走。
-var instSeq = 0
+// backendSeq 让每个用例的后端名唯一。命令队列 /sys/rwir-backend/<b>/cmd 是
+// Notify 队列，活在 kvspace 树外，DelTree 清不掉。用例若留下未被消费的任务
+// （比如超时用例），复用同一个后端名会让下一个用例的执行器把它捞走。
+//
+// 一级路由之后唯一化的是**后端名**而不是实例号 —— 后端名即实例名。
+var backendSeq = 0
 
-// registerBackend 注册能力与一个 running 实例，返回实例编号。
-func registerBackend(t *testing.T, kv kvspace.KVSpace, name, op string) string {
+// registerBackend 注册一个 ready 后端，返回它的唯一后端名。
+// opcode 是**完整算子名**（fake.echo），注册表不拆命名空间。
+func registerBackend(t *testing.T, kv kvspace.KVSpace, name, opcode string) string {
 	t.Helper()
-	instSeq++
-	inst := strconv.Itoa(instSeq)
+	backendSeq++
+	b := name + "-" + strconv.Itoa(backendSeq)
 	if err := kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysOpFunc(name, op), Val: kvspace.NewChar("1")},
-		{Key: keytree.SysOp(name, inst), Val: kvspace.NewChar(`{"status":"running","load":0}`)},
+		{Key: keytree.SysRwirBackendOp(b, opcode), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus(b), Val: kvspace.NewChar("ready")},
 	}); err != nil {
-		t.Fatalf("register %s.%s: %v", name, op, err)
+		t.Fatalf("register backend=%s op=%s: %v", b, opcode, err)
 	}
-	return inst
+	return b
 }
 
 // startBackend 起一个 echo 执行器：注册能力，然后循环消费命令队列。
 // 协议顺序与 examples/delegate/fake_backend.py 完全一致：写 outputs → 置
-// .status → Notify .done。
-func startBackend(t *testing.T, kv kvspace.KVSpace, name, op string) *backend {
-	return startBackendCfg(t, kv, name, op, backendCfg{status: "done", writeFirstN: -1})
+// .status → Notify 完成信号。
+func startBackend(t *testing.T, kv kvspace.KVSpace, name, opcode string) *backend {
+	return startBackendCfg(t, kv, name, opcode, backendCfg{status: "done", writeFirstN: -1})
 }
 
 // startBackendCfg 起一个行为可配置的执行器。配置在 goroutine 启动前固定。
-func startBackendCfg(t *testing.T, kv kvspace.KVSpace, name, op string, cfg backendCfg) *backend {
+func startBackendCfg(t *testing.T, kv kvspace.KVSpace, name, opcode string, cfg backendCfg) *backend {
 	t.Helper()
-	inst := registerBackend(t, kv, name, op)
+	be := registerBackend(t, kv, name, opcode)
 
-	b := &backend{cfg: cfg, inst: inst, done: make(chan struct{}), finished: make(chan struct{})}
+	b := &backend{cfg: cfg, name: be, done: make(chan struct{}), finished: make(chan struct{})}
 	go func() {
 		defer close(b.finished)
-		queue := keytree.SysOpCmd(name, inst)
+		queue := keytree.SysRwirBackendCmd(be)
 		handled := 0
 		for {
 			select {
@@ -289,7 +295,7 @@ main()
 // 读参被 isLiteral() 判成字面量，塞进任务的是变量名 "x" 而不是 "hello"。
 func TestDelegateWriteParamRedirect(t *testing.T) {
 	kv := newKV(t)
-	be := startBackend(t, kv, "fake", "echo")
+	be := startBackend(t, kv, "fake", "fake.echo")
 	defer be.stop()
 
 	loadSrc(t, kv, `
@@ -316,7 +322,7 @@ main()
 // TestDelegateResolvesLocalVariable 确认读参取的是局部变量的值而非变量名。
 func TestDelegateResolvesLocalVariable(t *testing.T) {
 	kv := newKV(t)
-	be := startBackend(t, kv, "fake", "echo")
+	be := startBackend(t, kv, "fake", "fake.echo")
 	defer be.stop()
 
 	loadSrc(t, kv, `
@@ -343,7 +349,7 @@ main()
 // 让计数器恒返 1 的实现照样能通过「‥delegseq == 3」这种断言。
 func TestDelegateTaskIDUniquePerIteration(t *testing.T) {
 	kv := newKV(t)
-	be := startBackend(t, kv, "fake", "echo")
+	be := startBackend(t, kv, "fake", "fake.echo")
 
 	loadSrc(t, kv, `
 rwir fake.echo(a:string) -> (b:string)
@@ -386,7 +392,7 @@ main()
 // 跨进程契约只能靠 map[string]any 上的断言守住。
 func TestOpTaskWireFormat(t *testing.T) {
 	kv := newKV(t)
-	be := startBackend(t, kv, "fake", "echo")
+	be := startBackend(t, kv, "fake", "fake.echo")
 	loadSrc(t, kv, `
 rwir fake.echo(a:string) -> (b:string)
 
@@ -433,7 +439,7 @@ main()
 	// done_key 必须由 taskID 导出，不能是 vthread 级别的共享键：
 	// 共享的话每轮循环又会读到上一轮迟到的信号，正是 taskID 带序号要防的事
 	id, _ := m["id"].(string)
-	if got, want := m["done_key"], keytree.SysTask(id, "done"); got != want {
+	if got, want := m["done_key"], keytree.DoneRwir(id); got != want {
 		t.Errorf("done_key = %v，期望 %q（必须由 taskID 导出）", got, want)
 	}
 	// inputs 传值、outputs 传绝对键
@@ -478,7 +484,7 @@ func contains(xs []string, s string) bool {
 // 就会撞号。这里同时钉住两个组成部分。
 func TestTaskIDCarriesVtid(t *testing.T) {
 	kv := newKV(t)
-	be := startBackend(t, kv, "fake", "echo")
+	be := startBackend(t, kv, "fake", "fake.echo")
 	loadSrc(t, kv, delegateSrc)
 
 	vtidA := run(t, kv, "init")
@@ -492,9 +498,11 @@ func TestTaskIDCarriesVtid(t *testing.T) {
 	if vtidA == vtidB {
 		t.Fatalf("两次 run 应得到不同 vtid，实得都是 %q", vtidA)
 	}
+	// 格式是 rwir:<backend>:<vtid>:<seq> —— vtid 在第 3 段，不是前缀。
 	for i, vtid := range []string{vtidA, vtidB} {
-		if !strings.HasPrefix(ids[i], vtid+"-") {
-			t.Errorf("taskID %q 未带 vtid 前缀 %q —— 跨 vthread 会撞号", ids[i], vtid)
+		parts := strings.Split(ids[i], ":")
+		if len(parts) != 4 || parts[0] != "rwir" || parts[2] != vtid {
+			t.Errorf("taskID %q 不符 rwir:<backend>:<vtid>:<seq> 且 vtid=%q —— 跨 vthread 会撞号", ids[i], vtid)
 		}
 	}
 	if ids[0] == ids[1] {
@@ -513,7 +521,7 @@ func TestTaskIDCarriesVtid(t *testing.T) {
 func TestDelegateTaskLifecycle(t *testing.T) {
 	t.Run("成功后回收 status 键", func(t *testing.T) {
 		kv := newKV(t)
-		be := startBackend(t, kv, "fake", "echo")
+		be := startBackend(t, kv, "fake", "fake.echo")
 		loadSrc(t, kv, delegateSrc)
 		run(t, kv, "init")
 		be.stop()
@@ -527,15 +535,15 @@ func TestDelegateTaskLifecycle(t *testing.T) {
 	t.Run("超时后留痕且停在 pending", func(t *testing.T) {
 		defer dispatch.SetTimeoutForTest(150 * time.Millisecond)()
 		kv := newKV(t)
-		registerBackend(t, kv, "fake", "echo") // 注册但不消费
+		be := registerBackend(t, kv, "fake", "fake.echo") // 注册但不消费
 		loadSrc(t, kv, delegateSrc)
 
 		vtid, err := start(t, kv, "init")
 		if err == nil {
 			t.Fatal("执行器不响应时应报错")
 		}
-		// taskID 是可预测的：vtid + 第 1 号委托
-		id := vtid + "-1"
+		// taskID 是可预测的：rwir:<backend>:<vtid>:<第 1 号委托>
+		id := "rwir:" + be + ":" + vtid + ":1"
 		if v := kvspace.GetOne(kv, keytree.SysTask(id, "status")); v.String() != "pending" {
 			t.Fatalf("超时后 /sys/task/%s.status 应留着 \"pending\" 供排查，实得 %q", id, v.String())
 		}
@@ -547,7 +555,7 @@ func TestDelegateTaskLifecycle(t *testing.T) {
 func TestDelegateSetsWaitStatus(t *testing.T) {
 	defer dispatch.SetTimeoutForTest(2 * time.Second)()
 	kv := newKV(t)
-	registerBackend(t, kv, "fake", "echo") // 注册但不消费 → VM 会一直等
+	registerBackend(t, kv, "fake", "fake.echo") // 注册但不消费 → VM 会一直等
 	loadSrc(t, kv, delegateSrc)
 
 	seen := make(chan string, 1)
@@ -588,12 +596,51 @@ rwfunc main() -> () {
 main()
 `)
 	vtid, err := start(t, kv, "init")
-	if err == nil || !strings.Contains(err.Error(), "no backend supports") {
-		t.Fatalf("期望路由失败错误，实得 %v", err)
+	if err == nil {
+		t.Fatal("声明了 rwir 但没有后端时应报错")
 	}
-	msg := kvspace.GetOne(kv, keytree.VThreadStatusMsg(vtid, "error"))
-	if !strings.Contains(msg.String(), "no backend supports") {
-		t.Fatalf("‥error/msg 未写入路由失败原因（reportRunError 会 exit 0），实得 %q", msg.String())
+	// 断言用户真正看到的那条：cmd/kvlang 的 reportRunError 打印并据以决定退出码的
+	// 是 ‥error/msg，Go error 只是内部终止信号。
+	//
+	// 判据是注册表，所以「声明了 rwir 但没后端」根本不会进委托分支 —— 它掉到
+	// default 走 rewrite as call，由 HandleCall 认出 kind=rwir 并给出诊断。
+	// 不认的话报的是 ExtIndex 的 "overlay failed"，那是实现细节，读的人一头雾水。
+	msg := kvspace.GetOne(kv, keytree.VThreadStatusMsg(vtid, "error")).String()
+	if !strings.Contains(msg, "没有后端支持") {
+		t.Fatalf("‥error/msg 应指出真因是没有后端，实得 %q", msg)
+	}
+	if strings.Contains(msg, "overlay") {
+		t.Fatalf("不该把 ExtIndex 的实现细节暴露给用户：%q", msg)
+	}
+}
+
+// TestDeclDiagnosticDoesNotMaskRealError 确认「没有后端支持」这条诊断不会盖掉
+// HandleCall 自己写的、更精确的失败原因。
+//
+// HandleCall 有多条返回 "" 的出口，checkDupParams 那条会写明重复参数名。
+// 无条件覆盖的话，签名参数写重了的用户会被指去起执行器 —— 正是这条诊断本想
+// 避免的误导，方向还反了。
+func TestDeclDiagnosticDoesNotMaskRealError(t *testing.T) {
+	kv := newKV(t)
+	loadSrc(t, kv, `
+rwir dup.op(a:string, a:string) -> (b:string)
+
+rwfunc main() -> () {
+	dup.op("x", "y") -> r
+}
+
+main()
+`)
+	vtid, err := start(t, kv, "init")
+	if err == nil {
+		t.Fatal("签名参数名重复应报错")
+	}
+	msg := kvspace.GetOne(kv, keytree.VThreadStatusMsg(vtid, "error")).String()
+	if !strings.Contains(msg, "duplicate") {
+		t.Fatalf("‥error/msg 应保留 HandleCall 写的重复参数诊断，实得 %q", msg)
+	}
+	if strings.Contains(msg, "起一个执行器") {
+		t.Fatalf("真因是签名写重了参数，不该指人去起执行器：%q", msg)
 	}
 }
 
@@ -612,7 +659,7 @@ main()
 func TestDelegateTimeout(t *testing.T) {
 	defer dispatch.SetTimeoutForTest(150 * time.Millisecond)()
 	kv := newKV(t)
-	registerBackend(t, kv, "fake", "echo") // 注册但不起消费者：任务推进队列后无人处理
+	registerBackend(t, kv, "fake", "fake.echo") // 注册但不起消费者：任务推进队列后无人处理
 	loadSrc(t, kv, delegateSrc)
 
 	vtid, err := start(t, kv, "init")
@@ -629,7 +676,7 @@ func TestDelegateTimeout(t *testing.T) {
 func TestDelegateBackendReportsFailed(t *testing.T) {
 	defer dispatch.SetTimeoutForTest(2 * time.Second)()
 	kv := newKV(t)
-	be := startBackendCfg(t, kv, "fake", "echo", backendCfg{status: "failed", writeFirstN: -1})
+	be := startBackendCfg(t, kv, "fake", "fake.echo", backendCfg{status: "failed", writeFirstN: -1})
 	loadSrc(t, kv, delegateSrc)
 
 	_, err := start(t, kv, "init")
@@ -645,7 +692,7 @@ func TestDelegateBackendReportsFailed(t *testing.T) {
 func TestDelegateReportsDoneWithoutWriting(t *testing.T) {
 	defer dispatch.SetTimeoutForTest(2 * time.Second)()
 	kv := newKV(t)
-	be := startBackendCfg(t, kv, "fake", "echo", backendCfg{status: "done", writeFirstN: 0})
+	be := startBackendCfg(t, kv, "fake", "fake.echo", backendCfg{status: "done", writeFirstN: 0})
 	loadSrc(t, kv, delegateSrc)
 
 	vtid, err := start(t, kv, "init")
@@ -670,7 +717,7 @@ func TestDelegateStaleOutputNotMistakenForSuccess(t *testing.T) {
 	kv := newKV(t)
 	// 只给第 1 个任务写输出，第 2 轮罢工。计数在消费 goroutine 内部完成，
 	// 外面不碰任何共享字段。
-	be := startBackendCfg(t, kv, "fake", "echo", backendCfg{status: "done", writeFirstN: 1})
+	be := startBackendCfg(t, kv, "fake", "fake.echo", backendCfg{status: "done", writeFirstN: 1})
 	loadSrc(t, kv, `
 rwir fake.echo(a:string) -> (b:string)
 
@@ -702,7 +749,7 @@ func TestDelegateArityMismatch(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kv := newKV(t)
-			be := startBackend(t, kv, "fake", "echo")
+			be := startBackend(t, kv, "fake", "fake.echo")
 			loadSrc(t, kv, "rwir fake.echo(a:string) -> (b:string)\n\n"+
 				"rwfunc main() -> () {\n\t"+tc.call+"\n}\n\nmain()\n")
 
@@ -725,7 +772,7 @@ func TestDelegateArityMismatch(t *testing.T) {
 // TestDelegateArityMatchStillWorks 反向确认上一条没有误伤正常调用。
 func TestDelegateArityMatchStillWorks(t *testing.T) {
 	kv := newKV(t)
-	be := startBackend(t, kv, "two", "join")
+	be := startBackend(t, kv, "two", "two.join")
 	defer be.stop()
 	loadSrc(t, kv, `
 rwir two.join(a:string, b:string) -> (c:string)
@@ -756,7 +803,7 @@ func TestDelegateOutputSlotIsWriteChecked(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kv := newKV(t)
-			be := startBackend(t, kv, "fake", "echo")
+			be := startBackend(t, kv, "fake", "fake.echo")
 			loadSrc(t, kv, "rwir fake.echo(a:string) -> (b:string)\n\n"+
 				"rwfunc main() -> () {\n\tfake.echo(\"X\") -> "+tc.slot+"\n}\n\nmain()\n")
 
@@ -789,12 +836,18 @@ func TestDelegateOutputSlotIsWriteChecked(t *testing.T) {
 
 // ── 判据与路由 ────────────────────────────────────────────────────────────
 
-// TestIsDelegatedDistinguishesKind 确认判据是声明（kind=rwir）而非命名空间前缀，
-// 因此 `lib tensor { }` 这类用户库不会被误判为委托。
-func TestIsDelegatedDistinguishesKind(t *testing.T) {
+// TestIsDelegatedOpReadsRegistry 钉住判据本身：**看后端注册表，不看 /lib**。
+//
+// 这是本轮改动的核心语义。前一版判据是 /lib 签名键的 kind=rwir，即"源码里
+// 声明了、就委托"；现在是"有后端声称能做、就委托"。两条 case 把差别钉死：
+//   - declared_only：源码里有 rwir 声明，但没有后端注册 → **不**委托
+//   - registered_only：源码里一个字没有，但后端注册了 → 委托
+//
+// 少了这两条，把 IsDelegatedOp 改回查 /lib 也能全绿。
+func TestIsDelegatedOpReadsRegistry(t *testing.T) {
 	kv := newKV(t)
 	loadSrc(t, kv, `
-rwir ext.op(a:string) -> (b:string)
+rwir declared.only(a:string) -> (b:string)
 
 lib tensor {
 	rwfunc matmul(a:string) -> (b:string) { a -> b }
@@ -802,23 +855,55 @@ lib tensor {
 
 rwfunc plain(a:string) -> (b:string) { a -> b }
 `)
+	registerBackend(t, kv, "gpu", "registered.only")
+	registerBackend(t, kv, "gpu", "tensor.matmul") // 后端盖过 /lib 里的同名 rwfunc
+
 	for _, tc := range []struct {
 		opcode string
 		want   bool
+		why    string
 	}{
-		{"ext.op", true},
-		{"tensor.matmul", false}, // 用户库，kind=rwfunc
-		{"plain", false},
-		{"nosuch", false}, // 不存在
+		{"registered.only", true, "后端注册了，源码没声明 —— 判据在注册表"},
+		{"declared.only", false, "源码声明了但没后端 —— 声明不构成委托"},
+		{"tensor.matmul", true, "后端注册会盖过 /lib 里的同名 rwfunc"},
+		{"plain", false, "普通用户函数"},
+		{"nosuch", false, "两边都没有"},
 	} {
-		if got := dispatch.IsDelegated(kv, tc.opcode); got != tc.want {
-			t.Errorf("IsDelegated(%q) = %v，期望 %v", tc.opcode, got, tc.want)
+		if got := dispatch.IsDelegatedOp(kv, tc.opcode); got != tc.want {
+			t.Errorf("IsDelegatedOp(%q) = %v，期望 %v（%s）", tc.opcode, got, tc.want, tc.why)
 		}
 	}
 }
 
-// TestTensorLibIsNotDelegated 端到端锁住上一条：删掉了硬编码的 tensor. 前缀
-// 分支之后，用户自己的 lib tensor 必须当普通函数执行并算出结果。
+// TestDelegateWithoutRwirDecl 端到端锁住"没有 /lib 声明也能委托"。
+//
+// 判据从声明搬到注册表之后，这条才成立；它同时证明 Delegate 里的参数个数校验
+// 在没有签名时是放行而不是硬失败。
+func TestDelegateWithoutRwirDecl(t *testing.T) {
+	kv := newKV(t)
+	be := startBackend(t, kv, "gpu", "gpu.blur")
+	defer be.stop()
+
+	// 注意：源码里**没有** `rwir gpu.blur(...)` 声明
+	loadSrc(t, kv, `
+rwfunc main() -> () {
+	gpu.blur("img") -> out
+}
+
+main()
+`)
+	vtid := run(t, kv, "init")
+	if got := kvspace.GetOne(kv, keytree.VThreadAt(vtid, "[0,0]/out")); got.String() != "img" {
+		t.Fatalf("无声明的 opcode 应照样委托：out=%q，期望 \"img\"", got.String())
+	}
+}
+
+// TestTensorLibIsNotDelegated：没有后端注册 tensor.matmul 时，用户自己的
+// lib tensor 必须当普通函数执行并算出结果。
+//
+// 硬编码的 `tensor.` 前缀分支就是被这条挡住的 —— 设计文档 04 的 Phase 1 想保留
+// 一条无条件 `strings.HasPrefix(opcode,"tensor.") → dispatch.Compute` 兜底，
+// 那会连用户自己起名叫 tensor 的库一起劫持。要恢复兜底就必须先判本地有没有定义。
 func TestTensorLibIsNotDelegated(t *testing.T) {
 	kv := newKV(t)
 	loadSrc(t, kv, `
@@ -840,163 +925,351 @@ main()
 	}
 }
 
-// TestSelectFindsRegisteredBackend 是 Select 最基本的一条：有一个已注册且
-// running 的后端时必须选中它。
+// TestSelectFindsRegisteredBackend 是 Select 最基本的一条：注册且 ready 时选中。
 //
-// 此前这条路从未成功执行过 —— kv.List 对目录子项返回带尾斜杠的名字（"fake/"），
-// 不剥离就拼出 /sys/op/fake//func/echo，kvspace 对非规范路径直接 panic。
+// 一并钉住"按完整 opcode 匹配"：注册的是 fake.echo，拿裸 echo 去查必须找不到。
+// 前一版按最后一个点拆成 (后端 fake, 算子 echo)，裸 echo 会扫中同一个后端 ——
+// 换句话说这半条用例在旧模型下是反的。
 func TestSelectFindsRegisteredBackend(t *testing.T) {
 	kv := newKV(t)
-	inst := registerBackend(t, kv, "fake", "echo")
+	be := registerBackend(t, kv, "fake", "fake.echo")
 
-	b, n, err := dispatch.Select(context.Background(), kv, "fake.echo")
-	if err != nil || b != "fake" || n != inst {
-		t.Fatalf("带命名空间：实得 (%q,%q,%v)，期望 (\"fake\",%q,nil)", b, n, err, inst)
+	b, err := dispatch.Select(context.Background(), kv, "fake.echo")
+	if err != nil || b != be {
+		t.Fatalf("实得 (%q,%v)，期望 (%q,nil)", b, err, be)
 	}
-	b, n, err = dispatch.Select(context.Background(), kv, "echo")
-	if err != nil || b != "fake" || n != inst {
-		t.Fatalf("裸算子（扫全部后端）：实得 (%q,%q,%v)，期望 (\"fake\",%q,nil)", b, n, err, inst)
-	}
-}
-
-// TestSelectMultiDotOpcodeSplitsAtLastDot 钉住多级点号算子的切分点。
-// "a.b.c" 必须拆成后端 "a.b" + 算子 "c"，不是 "a" + "b.c" —— 执行器按哪个
-// 规则注册决定了它到底会不会被选中，切分点变了就永远匹配不上。
-func TestSelectMultiDotOpcodeSplitsAtLastDot(t *testing.T) {
-	kv := newKV(t)
-	inst := registerBackend(t, kv, "a.b", "c")    // 按"最后一个点"注册
-	registerBackend(t, kv, "a", "b.c")            // 按"第一个点"注册的干扰项
-
-	b, n, err := dispatch.Select(context.Background(), kv, "a.b.c")
-	if err != nil || b != "a.b" || n != inst {
-		t.Fatalf("a.b.c 应选中后端 \"a.b\"（实例 %s），实得 (%q,%q,%v)", inst, b, n, err)
+	if _, err := dispatch.Select(context.Background(), kv, "echo"); err == nil {
+		t.Fatal("注册的是完整 opcode fake.echo，裸 echo 不该匹配")
 	}
 }
 
-// TestSelectNamespaceIsBackend 确认命名空间即后端名：找不到就报错，
-// 不静默回退到某个碰巧也注册了同名算子的后端。
-func TestSelectNamespaceIsBackend(t *testing.T) {
+// TestSelectNoBackend 覆盖「一个后端都没注册该算子」。
+func TestSelectNoBackend(t *testing.T) {
 	kv := newKV(t)
-	registerBackend(t, kv, "llm", "complete") // llm 只支持 complete
-	registerBackend(t, kv, "other", "chat")   // other 支持 chat
+	registerBackend(t, kv, "llm", "llm.complete")
 
-	if _, _, err := dispatch.Select(context.Background(), kv, "llm.chat"); err == nil {
-		t.Fatal("llm 不支持 chat 时应报错，而不是把任务投给 other")
-	}
-	b, _, err := dispatch.Select(context.Background(), kv, "other.chat")
-	if err != nil || b != "other" {
-		t.Fatalf("other.chat 应选中 other，实得 backend=%q err=%v", b, err)
-	}
-}
-
-// TestSelectSkipsStoppedInstance 确认候选后端的实例不可用时会继续找别的候选，
-// 而不是锁定第一个候选后硬失败。
-func TestSelectSkipsStoppedInstance(t *testing.T) {
-	kv := newKV(t)
-	// aaa 注册了 echo 但实例是 stopped；zzz 注册了 echo 且 running
-	kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysOpFunc("aaa", "echo"), Val: kvspace.NewChar("1")},
-		{Key: keytree.SysOp("aaa", "0"), Val: kvspace.NewChar(`{"status":"stopped","load":0}`)},
-	})
-	inst := registerBackend(t, kv, "zzz", "echo")
-
-	b, n, err := dispatch.Select(context.Background(), kv, "echo")
-	if err != nil || b != "zzz" || n != inst {
-		t.Fatalf("应跳过 stopped 的 aaa 选中 zzz，实得 (%q,%q,%v)", b, n, err)
-	}
-}
-
-// TestSelectNoRunningInstance 覆盖「后端支持该算子、但没有一个 running 实例」。
-// 少了 n == "" 那道检查，Select 会返回 ("","",nil)，Delegate 随后把任务推到
-// 一个畸形队列路径上 —— 报错分支必须真的产出过一次才算数。
-func TestSelectNoRunningInstance(t *testing.T) {
-	kv := newKV(t)
-	kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysOpFunc("dead", "echo"), Val: kvspace.NewChar("1")},
-		{Key: keytree.SysOp("dead", "0"), Val: kvspace.NewChar(`{"status":"stopped","load":0}`)},
-	})
-	b, n, err := dispatch.Select(context.Background(), kv, "dead.echo")
+	_, err := dispatch.Select(context.Background(), kv, "llm.chat")
 	if err == nil {
-		t.Fatalf("没有 running 实例时必须报错，实得 (%q,%q,nil)", b, n)
+		t.Fatal("没有后端支持 llm.chat 时必须报错")
 	}
-	if !strings.Contains(err.Error(), "no running instance") {
-		t.Fatalf("错误信息应指明没有可用实例，实得 %v", err)
+	if !strings.Contains(err.Error(), "no backend supports") {
+		t.Fatalf("错误信息应指明没有后端支持，实得 %v", err)
 	}
 }
 
-// TestSelectPicksLowestLoad 确认真的在按负载挑实例。
-// 此前所有用例的实例 load 都是 0，比较逻辑（含 >= 与 > 之别、以及到底有没有
-// 记录当前最优）完全不可观测。
+// TestSelectSkipsNotReadyBackend 确认候选里有不可用的后端时会继续找别的候选，
+// 而不是锁定第一个候选后硬失败。offline 的 aaa 排在 zzz 前面（List 按插入序）。
+func TestSelectSkipsNotReadyBackend(t *testing.T) {
+	kv := newKV(t)
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("aaa", "x.echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("aaa"), Val: kvspace.NewChar("offline")},
+	})
+	be := registerBackend(t, kv, "zzz", "x.echo")
+
+	b, err := dispatch.Select(context.Background(), kv, "x.echo")
+	if err != nil || b != be {
+		t.Fatalf("应跳过 offline 的 aaa 选中 %s，实得 (%q,%v)", be, b, err)
+	}
+}
+
+// TestVMPrimitivesBeatRegistry 钉住调度链顺序：**VM 原语永远赢过后端注册**。
+//
+// 这条不变量在 execute.go 与 router.go 的注释里被反复声明，却一直零测试覆盖 ——
+// 把委托分支挪到 IsControlOp / IsNativeOp / isCopyOp 之上，全仓测试照样全绿。
+// 注册表是外部进程自由写入的，能夺走这三类就等于把整个语言的语义交出去：
+//   - 劫持 print：程序打印的每一个值都流向外部后端
+//   - 劫持 =    ：后端拿到被赋的值与写槽绝对路径，写什么变量就是什么
+//
+// 每个 case 都注册一个真执行器（会把 input 原样回写），所以一旦劫持成功，
+// 断言的不只是"任务数为 0"，还有程序结果被改写。
+func TestVMPrimitivesBeatRegistry(t *testing.T) {
+	for _, tc := range []struct{ name, opcode, src, wantKey, wantVal string }{
+		{"内建 print", "print", `
+rwfunc main() -> () {
+	42 -> v
+	print(v)
+}
+
+main()
+`, "[0,0]/v", "42"},
+		{"赋值 =", "=", `
+rwfunc main() -> () {
+	7 -> x
+}
+
+main()
+`, "[0,0]/x", "7"},
+		{"算术 +", "+", `
+rwfunc main() -> () {
+	3 + 4 -> y
+}
+
+main()
+`, "[0,0]/y", "7"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kv := newKV(t)
+			be := startBackend(t, kv, "evil", tc.opcode)
+			loadSrc(t, kv, tc.src)
+			vtid := run(t, kv, "init")
+			be.stop()
+
+			if ids := be.taskIDs(); len(ids) != 0 {
+				t.Errorf("opcode %q 被后端劫持了，收到任务 %v", tc.opcode, ids)
+			}
+			if got := kvspace.GetOne(kv, keytree.VThreadAt(vtid, tc.wantKey)); got.String() != tc.wantVal {
+				t.Errorf("%s = %q，期望 %q —— 结果被劫持改写", tc.wantKey, got.String(), tc.wantVal)
+			}
+		})
+	}
+}
+
+// TestAbsolutePathCallDoesNotPanic 是一条崩溃回归。
+//
+// `/lib/math.sum(3,4) -> s` 这种绝对路径调用形态（仓库自带
+// tutorial/06-lib/cross/inline.kv 与 lib_b.kv 就这么写）让 opcode 带上斜杠。
+// 委托判据把 opcode 原样拼进 /sys/rwir-backend/<b>/op/<opcode>，得到双斜杠，
+// 而 art 后端对非规范路径是 **panic 而非报错**，kvlang 全仓零处 recover
+// —— 整个 VM 带着 Go 栈当场死掉。
+//
+// 两个条件缺一都看不到，所以既有测试与 tutorial 全都漏了它：
+//   - 注册表必须非空（循环体一次都不进就不会拼这个键）；offline 的记录也算，
+//     因为 GetOne 发生在在岗判定之前
+//   - 必须是 art://（redis 后端一处路径校验都没有，只会静默查不到）
+func TestAbsolutePathCallDoesNotPanic(t *testing.T) {
+	kv := newKV(t)
+	// 注册表非空即可，这个后端与被调函数毫无关系
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("llm", "llm.chat"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("llm"), Val: kvspace.NewChar("offline")},
+	})
+	loadSrc(t, kv, `
+lib math { rwfunc sum(A:int64, B:int64) -> (C:int64) { A + B -> C } }
+
+rwfunc main() -> () {
+	/lib/math.sum(3, 4) -> s
+}
+
+main()
+`)
+	vtid := run(t, kv, "init") // 不 panic 即通过第一关
+	if got := kvspace.GetOne(kv, keytree.VThreadAt(vtid, "[0,0]/s")); got.String() != "7" {
+		t.Fatalf("绝对路径调用应正常本地执行：s=%q，期望 \"7\"", got.String())
+	}
+}
+
+// TestBadOpcodeShapesAreNotDelegated 覆盖其余不能当路径段用的 opcode 形态。
+// 每一条在加守卫前都会让 art 后端 panic。
+func TestBadOpcodeShapesAreNotDelegated(t *testing.T) {
+	kv := newKV(t)
+	registerBackend(t, kv, "any", "any.op") // 让注册表非空
+	for _, opcode := range []string{"/lib/math.sum", "..", ".", "x//y", "../evil", "", "a/b"} {
+		if dispatch.IsDelegatedOp(kv, opcode) {
+			t.Errorf("IsDelegatedOp(%q) 不该为真 —— 这种名字注册不上", opcode)
+		}
+		if _, err := dispatch.Select(context.Background(), kv, opcode); err == nil {
+			t.Errorf("Select(%q) 应报错而不是 panic 或误选", opcode)
+		}
+	}
+}
+
+// TestSelectNoOnDutyBackend 覆盖「后端注册了该算子、但没有一个在岗」。
+// 这条与「没人支持」必须报不同的错：前者是执行器挂了，后者是算子名拼错或忘了
+// 装后端 —— 处置完全不同。
+func TestSelectNoOnDutyBackend(t *testing.T) {
+	kv := newKV(t)
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("dead", "dead.echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("dead"), Val: kvspace.NewChar("offline")},
+	})
+	b, err := dispatch.Select(context.Background(), kv, "dead.echo")
+	if err == nil {
+		t.Fatalf("没有在岗后端时必须报错，实得 (%q,nil)", b)
+	}
+	if !strings.Contains(err.Error(), "no on-duty backend") {
+		t.Fatalf("错误信息应区别于「没人支持」，实得 %v", err)
+	}
+}
+
+// TestBusyBackendIsStillUsable 钉住 busy 算在岗。
+//
+// 文档 01 的 status 词表是 ready|busy|offline。把 busy 当不可用，会让一个短暂
+// 繁忙的后端直接触发硬失败 —— 而它自报的 load 本来就足以让 Select 避开它。
+func TestBusyBackendIsStillUsable(t *testing.T) {
+	kv := newKV(t)
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("b1", "busy.echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("b1"), Val: kvspace.NewChar("busy")},
+	})
+	if !dispatch.IsDelegatedOp(kv, "busy.echo") {
+		t.Fatal("busy 后端应算在岗 → 仍判定为可委托")
+	}
+	if b, err := dispatch.Select(context.Background(), kv, "busy.echo"); err != nil || b != "b1" {
+		t.Fatalf("busy 后端应可被选中，实得 (%q,%v)", b, err)
+	}
+}
+
+// TestOfflineBackendFallsBackToLocal 是本轮最容易漏的一条语义。
+//
+// 文档 01 规定注销时只写 status=offline、**不删 op 子键**（记录留着排障）。
+// 若 IsDelegatedOp 只看 op 子键存在性，一个永久死掉的后端会永久霸占该 opcode：
+// 判定为可委托 → Select 选不出 → Delegate 直接 SetError 硬失败，既不回落本地、
+// 也没有任何后端能接手。这里要求它回落到 /lib 里的同名 rwfunc 并真的算出结果。
+//
+// 同时钉住 IsDelegatedOp 与 Select 判定一致：不一致就会出现「说能委托、却选不出」
+// 的空档。
+func TestOfflineBackendFallsBackToLocal(t *testing.T) {
+	kv := newKV(t)
+	loadSrc(t, kv, `
+lib tensor {
+	rwfunc matmul(a:int64, b:int64) -> (c:int64) {
+		a * b -> c
+	}
+}
+
+rwfunc main() -> () {
+	tensor.matmul(6, 7) -> r
+}
+
+main()
+`)
+	// 注册后再下线：op 子键留着，只把 status 改成 offline
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("gpu", "tensor.matmul"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("gpu"), Val: kvspace.NewChar("ready")},
+	})
+	if !dispatch.IsDelegatedOp(kv, "tensor.matmul") {
+		t.Fatal("前置条件不成立：ready 时应判定为可委托")
+	}
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendStatus("gpu"), Val: kvspace.NewChar("offline")},
+	})
+
+	if dispatch.IsDelegatedOp(kv, "tensor.matmul") {
+		t.Fatal("后端下线后不该再判定为可委托 —— op 子键还在，但没人在岗")
+	}
+	vtid := run(t, kv, "init")
+	if got := kvspace.GetOne(kv, keytree.VThreadAt(vtid, "[0,0]/r")); got.String() != "42" {
+		t.Fatalf("后端下线应回落到 /lib 里的同名 rwfunc：r=%q，期望 \"42\"", got.String())
+	}
+}
+
+// TestSelectMissingStatusIsNotReady 钉住「status 键缺失 ≠ ready」。
+// 后端注册是多次写入，op 子键先落、status 后落是常态；这个窗口里必须当它不可用，
+// 否则任务会投给一个还没准备好的进程。把 status 判定写成"非 offline 即可用"
+// 就会在这里变红。
+func TestSelectMissingStatusIsNotReady(t *testing.T) {
+	kv := newKV(t)
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("half", "half.echo"), Val: kvspace.NewChar("1")},
+	}) // 只写了能力声明，没写 status
+
+	if _, err := dispatch.Select(context.Background(), kv, "half.echo"); err == nil {
+		t.Fatal("status 缺失的后端不该被选中")
+	}
+}
+
+// TestSelectPicksLowestLoad 确认真的在按负载挑后端。
+// 所有后端 load 都是 0 的话，比较逻辑（含 >= 与 > 之别、以及到底有没有记录
+// 当前最优）完全不可观测。
 func TestSelectPicksLowestLoad(t *testing.T) {
 	kv := newKV(t)
-	kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysOpFunc("multi", "echo"), Val: kvspace.NewChar("1")},
-		{Key: keytree.SysOp("multi", "7"), Val: kvspace.NewChar(`{"status":"running","load":0.9}`)},
-		{Key: keytree.SysOp("multi", "8"), Val: kvspace.NewChar(`{"status":"running","load":0.1}`)},
-		{Key: keytree.SysOp("multi", "9"), Val: kvspace.NewChar(`{"status":"running","load":0.5}`)},
-	})
-	_, n, err := dispatch.Select(context.Background(), kv, "multi.echo")
-	if err != nil || n != "8" {
-		t.Fatalf("应选中 load 最低的实例 8，实得 (%q,%v)", n, err)
+	for _, tc := range []struct{ name, load string }{{"m7", "0.9"}, {"m8", "0.1"}, {"m9", "0.5"}} {
+		kv.Set([]kvspace.KVPair{
+			{Key: keytree.SysRwirBackendOp(tc.name, "m.echo"), Val: kvspace.NewChar("1")},
+			{Key: keytree.SysRwirBackendStatus(tc.name), Val: kvspace.NewChar("ready")},
+			{Key: keytree.SysRwirBackendLoad(tc.name), Val: kvspace.NewChar(tc.load)},
+		})
+	}
+	b, err := dispatch.Select(context.Background(), kv, "m.echo")
+	if err != nil || b != "m8" {
+		t.Fatalf("应选中 load 最低的 m8，实得 (%q,%v)", b, err)
 	}
 }
 
-// TestSelectIgnoresMalformedInstance 确认一条损坏的实例记录不会让路由 panic
-// 或选错 —— 注册表是外部进程写的，一定会出现半截数据。
+// TestSelectMalformedLoadDoesNotWin 确认坏 load 不会**胜过**正常后端。
 //
-// 关键是最后那条 `{"status":"running","load":"x"}`：json.Unmarshal 会**报错但
-// 仍把 Status 填成 "running"**（load 字段类型不符才失败）。用截断 JSON 测是测
-// 不出来的 —— 那种情况 info 全零，后面的 status != "running" 顺手就挡掉了，
-// 于是"检查 Unmarshal 错误"这行删掉也照样绿。这条记录 Load 解析成 0，是最低
-// 负载，忽略错误的话它会**胜过**正常实例。
-func TestSelectIgnoresMalformedInstance(t *testing.T) {
+// 注册表是外部进程写的，半截/畸形数据是常态。而 0 是最低负载：把坏值当 0 参与
+// 竞争，一个写坏了 load 的后端会吸走全部流量。
+//
+// 只判 strconv.ParseFloat 的 err 是不够的，下面三类都能解析成功却毁掉路由：
+//   - "NaN"：NaN 与任何数比较都是 false ⇒ `load >= bestLoad` 恒不成立 ⇒ 每个
+//     后端都覆盖前一个，「负载最低」无声退化成「最后注册的赢」。
+//   - "-Inf" / "-5"：负值恒小于一切，该后端永远独占路由。
+//   - "2"：超出 [0,1] 的自报值同样不可信。
+//
+// **两种注册顺序都要测**，否则测不出 NaN。负值的失效形态是"坏的恒赢"，坏后端
+// 先注册就能抓到；而 NaN 的失效形态是"最后注册的赢"——坏后端排在前面时，正常
+// 后端反而侥幸胜出，用例照绿。实测：只测一种顺序时，去掉 NaN 判定的变异存活。
+func TestSelectMalformedLoadDoesNotWin(t *testing.T) {
+	for _, bad := range []string{"not-a-number", "", "NaN", "Inf", "-Inf", "-5", "2", "1e400"} {
+		for _, badFirst := range []bool{true, false} {
+			order := "坏的先注册"
+			if !badFirst {
+				order = "坏的后注册"
+			}
+			t.Run("load="+bad+"/"+order, func(t *testing.T) {
+				kv := newKV(t)
+				op := "mix.echo"
+				reg := func(name, load string) {
+					kv.Set([]kvspace.KVPair{
+						{Key: keytree.SysRwirBackendOp(name, op), Val: kvspace.NewChar("1")},
+						{Key: keytree.SysRwirBackendStatus(name), Val: kvspace.NewChar("ready")},
+						{Key: keytree.SysRwirBackendLoad(name), Val: kvspace.NewChar(load)},
+					})
+				}
+				if badFirst {
+					reg("bad", bad)
+					reg("good", "0.5")
+				} else {
+					reg("good", "0.5")
+					reg("bad", bad)
+				}
+				if b, err := dispatch.Select(context.Background(), kv, op); err != nil || b != "good" {
+					t.Fatalf("load=%q（%s）的后端不该胜过 load=0.5 的正常后端：实得 (%q,%v)", bad, order, b, err)
+				}
+			})
+		}
+	}
+}
+
+// TestSelectAllLoadsMalformedStillPicksOne 确认坏 load 是「降级」不是「排除」：
+// 全场只有坏后端时仍要选出一个，而不是报「无可用后端」。
+func TestSelectAllLoadsMalformedStillPicksOne(t *testing.T) {
 	kv := newKV(t)
 	kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysOpFunc("mixed", "echo"), Val: kvspace.NewChar("1")},
-		{Key: keytree.SysOp("mixed", "80"), Val: kvspace.NewChar(`{"status":`)},                    // 截断
-		{Key: keytree.SysOp("mixed", "81"), Val: kvspace.NewChar(`not json`)},                      // 非 JSON
-		{Key: keytree.SysOp("mixed", "82"), Val: kvspace.NewChar(`{"status":"running","load":"x"}`)}, // 部分可解码
-		{Key: keytree.SysOp("mixed", "83"), Val: kvspace.NewChar(`{"status":"running","load":0.5}`)}, // 唯一合法的
+		{Key: keytree.SysRwirBackendOp("only", "solo.echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("only"), Val: kvspace.NewChar("ready")},
+		{Key: keytree.SysRwirBackendLoad("only"), Val: kvspace.NewChar("NaN")},
 	})
-	_, n, err := dispatch.Select(context.Background(), kv, "mixed.echo")
-	if err != nil || n != "83" {
-		t.Fatalf("应跳过全部损坏记录选中 83，实得 (%q,%v)", n, err)
+	if b, err := dispatch.Select(context.Background(), kv, "solo.echo"); err != nil || b != "only" {
+		t.Fatalf("唯一后端即使 load 畸形也应被选中，实得 (%q,%v)", b, err)
 	}
 }
 
 // TestSelectEqualLoadIsStable 钉住等负载时的取舍：先注册的胜出。
 //
-// 常见情形恰恰是"一堆实例都空闲（load 全 0）"，此时 `>=` 与 `>` 的差别就是
+// 常见情形恰恰是"一堆后端都空闲（load 全缺省 0）"，此时 `>=` 与 `>` 的差别就是
 // 全部结果 —— 前者先到先得，后者后来居上。两种都说得通，但必须钉死一个，
 // 否则哪天有人"顺手"改了比较符，路由目标会整体漂移而没有任何测试变红。
 // kv.List 返回插入顺序（实测三次调用结果一致），所以"先注册"是可控的。
 func TestSelectEqualLoadIsStable(t *testing.T) {
 	kv := newKV(t)
-	kv.Set([]kvspace.KVPair{{Key: keytree.SysOpFunc("tie", "echo"), Val: kvspace.NewChar("1")}})
-	// 分两次写入以保证顺序：先 10，后 11，负载相同
-	kv.Set([]kvspace.KVPair{{Key: keytree.SysOp("tie", "10"), Val: kvspace.NewChar(`{"status":"running","load":0.2}`)}})
-	kv.Set([]kvspace.KVPair{{Key: keytree.SysOp("tie", "11"), Val: kvspace.NewChar(`{"status":"running","load":0.2}`)}})
+	// 分两次写入以保证顺序：先 t10，后 t11，均不写 load（缺省 0）
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("t10", "tie.echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("t10"), Val: kvspace.NewChar("ready")},
+	})
+	kv.Set([]kvspace.KVPair{
+		{Key: keytree.SysRwirBackendOp("t11", "tie.echo"), Val: kvspace.NewChar("1")},
+		{Key: keytree.SysRwirBackendStatus("t11"), Val: kvspace.NewChar("ready")},
+	})
 
 	for i := 0; i < 3; i++ { // 顺带确认结果稳定，不随调用次数漂移
-		_, n, err := dispatch.Select(context.Background(), kv, "tie.echo")
-		if err != nil || n != "10" {
-			t.Fatalf("第 %d 次：等负载应选先注册的 10，实得 (%q,%v)", i+1, n, err)
+		b, err := dispatch.Select(context.Background(), kv, "tie.echo")
+		if err != nil || b != "t10" {
+			t.Fatalf("第 %d 次：等负载应选先注册的 t10，实得 (%q,%v)", i+1, b, err)
 		}
-	}
-}
-
-// TestSelectSkipsFuncSubtree 确认 /sys/op/<b>/func/ 不会被当成实例编号。
-// List 返回的是 "func/" 而非 "func"，按 "func" 比较的话永远不匹配，
-// 于是 GetOne(/sys/op/fake/func) 返回 None 才侥幸跳过 —— 换成有值就会选错。
-func TestSelectSkipsFuncSubtree(t *testing.T) {
-	kv := newKV(t)
-	inst := registerBackend(t, kv, "fake", "echo")
-	// 给 func 目录本身放一个看起来像实例记录的值
-	kv.Set([]kvspace.KVPair{
-		{Key: keytree.SysRoot + "/op/fake/func", Val: kvspace.NewChar(`{"status":"running","load":0}`)},
-	})
-	b, n, err := dispatch.Select(context.Background(), kv, "echo")
-	if err != nil || b != "fake" || n != inst {
-		t.Fatalf("func 子树被当成实例：实得 (%q,%q,%v)，期望 (\"fake\",%q,nil)", b, n, err, inst)
 	}
 }

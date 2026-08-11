@@ -1,0 +1,7 @@
+# expected:
+#   PermissionError: 写槽指向受保护域 /done
+# /done 是委托完成信号所在的命名空间，整域归引擎。
+rwfunc main() -> () {
+	"1" -> /done/rwir/forged
+}
+main()

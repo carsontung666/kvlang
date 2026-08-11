@@ -119,8 +119,10 @@ echo $! > "$TMP/be.pid"
 # 机器一忙就超过任何拍脑袋的等待时间，在 CI 上表现为间歇性失败。
 i=0
 while [ "$i" -lt 100 ]; do
-	case $("$KVSPACE_CLI" --kvspace "$DSN" get /sys/op/fake/0 2>/dev/null) in
-		*running*) break ;;
+	# 探 status 而非 op 子键：注册顺序是能力先写、status 最后写，
+	# 所以 status=ready 才代表整套注册都落地了。
+	case $("$KVSPACE_CLI" --kvspace "$DSN" get /sys/rwir-backend/fake/status 2>/dev/null) in
+		*ready*) break ;;
 	esac
 	i=$((i + 1)); sleep 0.1
 done

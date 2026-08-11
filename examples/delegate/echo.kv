@@ -5,7 +5,7 @@
 # 委托 rwir 验收样例。
 # fake.echo 只有签名没有指令体 → /lib/fake.echo 的 kind 是 rwir → VM 委托给外部执行器。
 # 需要先起 examples/delegate/fake_backend.py，且 kvspace 必须是 redis://
-# （art:// 是进程内的，外部进程看不见 /sys/op）。
+# （art:// 是进程内的，外部进程看不见 /sys/rwir-backend）。
 
 rwir fake.echo(a:string) -> (b:string)
 

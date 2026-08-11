@@ -116,7 +116,7 @@ func TestNamedDeclHasNoNameError(t *testing.T) {
 // TestDanglingDotIsSyntaxError 锁住"点后面必须跟标识符"。
 // 少了这道检查，`rwir fake.(a:string) -> (b:string)` 会一路解析通过、无诊断，
 // 写出名字为 "fake." 的畸形键 /lib/fake. —— 既不可能被调用点命中，也不可能
-// 被路由（splitOp 会切出空算子名）。实测未修前 kvlang layout 退出码为 0。
+// 被路由（空算子名不会有后端注册）。实测未修前 kvlang layout 退出码为 0。
 func TestDanglingDotIsSyntaxError(t *testing.T) {
 	for _, src := range []string{
 		"rwir fake.(a:string) -> (b:string)\n",

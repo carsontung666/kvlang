@@ -18,7 +18,8 @@ const LibRoot = PathSegSep + PathSegLib
 // ——拆开再用同一个分隔符拼回是恒等变换，用第一个点拆输出完全相同（已对含多个
 // 点、前导点、尾随点、连续点、/lib 前缀等 11 种输入逐一比对确认）。保留 pkg/name
 // 的形式只是为了和 LibFunc 的调用约定对齐；别据此以为这里的切分规则是语义的一部分。
-// 真正对切分点敏感的是 dispatch.splitOp（那里 ns 要当后端名去查 /sys/op）。
+// 委托路由不再拆点：后端注册表 /sys/rwir-backend/<b>/op/<opcode> 存的是完整
+// opcode，判据拿调用点的 opcode 直接查（见 dispatch.backendsFor）。
 func FuncKey(funcName string) string {
 	var pkg string
 	libPrefix := LibRoot + PathSegSep

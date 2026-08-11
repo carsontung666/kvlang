@@ -147,6 +147,22 @@ func HandleCall(ctx context.Context, kv kvspace.KVSpace, pc string, inst *rwir.R
 		return ""
 	}
 
+	// kind=rwir 是**只有签名、没有指令体**的声明（源码里的 `rwir name(...) -> (...)`），
+	// 只能由外部后端执行。走到这里说明委托判据没认它 —— 即没有任何在岗后端在
+	// /sys/rwir-backend/<b>/op/<name> 注册过它。
+	//
+	// 必须在这里拦掉，否则下面的 ExtIndex 会因为 /lib/<name>/ 目录不存在而失败，
+	// 报出 "overlay failed"：那是实现细节，读的人只会一头雾水，真正该做的是去把
+	// 执行器起起来。放在 checkDupParams 之后 —— 签名自身写错了是源码 bug，
+	// 无论有没有后端都得先修。
+	if sigVal.Kind() == kvspace.KindRwir {
+		vthread.SetError(ctx, kv, vtid, pc, fmt.Sprintf(
+			"RuntimeError: %s 声明为 rwir（只有签名，需委托执行），但没有后端支持它; "+
+				"help: 起一个执行器，在 %s/<backend>/op/ 下注册 %q",
+			funcName, keytree.SysRwirBackendRoot, funcName))
+		return ""
+	}
+
 	callerFrameRoot := keytree.FrameRoot(pc)
 	frameRoot := pc // callPC = 子帧根
 

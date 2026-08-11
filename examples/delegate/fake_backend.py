@@ -2,10 +2,10 @@
 """委托机制的最小外部执行器。
 
 它做的事就是委托 ABI 的全部内容：
-  1. 在 /sys/op/fake/ 注册能力与实例
+  1. 在 /sys/rwir-backend/fake/ 注册能力（这张表就是 VM 的委托判据）
   2. watch 命令队列
   3. 收到任务 → 把 input 原样写进 output key
-  4. 置 .status=done，再 notify per-task 的 .done 键
+  4. 置 .status=done，再 notify per-task 的完成信号
 
 跑法（两个终端）：
     redis-server --port 6379 &
@@ -13,7 +13,7 @@
     python3 examples/delegate/fake_backend.py &
     ./kvlang examples/delegate/echo.kv
 
-art:// 下不工作 —— 那是进程内 kvspace，外部进程看不见 /sys/op。
+art:// 下不工作 —— 那是进程内 kvspace，外部进程看不见 /sys/rwir-backend。
 
 关停执行器时要连它的 kvspace 子进程一起杀（先 pkill -P 再 kill 父进程）。
 只杀父进程的话，阻塞在 watch 上的子进程会变成孤儿，而 go-redis 客户端会
@@ -21,6 +21,7 @@ art:// 下不工作 —— 那是进程内 kvspace，外部进程看不见 /sys/
 特有的问题，任何用子进程做 watch 的执行器实现都要注意。
 """
 
+import atexit
 import json
 import os
 import subprocess
@@ -30,8 +31,9 @@ KV = os.environ.get("KVSPACE_CLI", "kvspace")
 DSN = os.environ.get("KVLANG_KVSPACE", "redis://127.0.0.1:6379")
 
 BACKEND = "fake"
-INSTANCE = "0"
-OPS = ["echo"]                      # 注册的是剥掉命名空间前缀的名字：fake.echo → echo
+# 注册的是**完整 opcode**，不剥命名空间 —— VM 拿调用点的 opcode 直接查这张表。
+# 后端名（fake）与 opcode 的命名空间（fake.）没有必须相等的关系，这里同名纯属巧合。
+OPS = ["fake.echo"]
 
 # watch 用有限超时而不是 0（永久阻塞）：命令队列是持久的（redis 是 LPUSH/BLPOP
 # 列表），两次 watch 之间推进来的任务不会丢，而有限超时能让 kvspace 子进程定期
@@ -68,16 +70,20 @@ def kvset(key, value):
 
 
 def register():
-    """能力声明 + 实例记录。
+    """能力声明 + 就绪状态。
 
-    /sys/op/<b>/func/<op> 只要存在即算支持，值无所谓。
-    /sys/op/<b>/<n> 是 {status, load} JSON，Select 只挑 status=running 的。
+    /sys/rwir-backend/<b>/op/<opcode>  存在即算支持，值无所谓。**这就是委托判据**。
+    /sys/rwir-backend/<b>/status       ready|busy 算在岗；offline 或缺失都不会被选中。
+    /sys/rwir-backend/<b>/load         可选，[0,1]；缺省按 0，畸形按满载。
+
+    顺序要紧：**能力声明先写、status 最后写**。反过来的话，status=ready 已经
+    可见而 op 子键还没落地，VM 这一瞬间会认为该 opcode 无人支持。
     """
     for op in OPS:
-        kvset(f"/sys/op/{BACKEND}/func/{op}", "1")
-    kvset(f"/sys/op/{BACKEND}/{INSTANCE}",
-          json.dumps({"status": "running", "load": 0.0}))
-    print(f"[backend] registered /sys/op/{BACKEND} ops={OPS}", flush=True)
+        kvset(f"/sys/rwir-backend/{BACKEND}/op/{op}", "1")
+    kvset(f"/sys/rwir-backend/{BACKEND}/load", "0")
+    kvset(f"/sys/rwir-backend/{BACKEND}/status", "ready")
+    print(f"[backend] registered /sys/rwir-backend/{BACKEND} ops={OPS}", flush=True)
 
 
 def handle(task):
@@ -108,9 +114,22 @@ def handle(task):
     kv("notify", done_key, "1")
 
 
+def deregister():
+    """退出时置 offline。
+
+    kvspace 是持久的：不置 offline 就把 status=ready 留在注册表里，下一次
+    kvlang 跑同一段程序会把任务派给一个已经死掉的进程，然后等满整个超时。
+    照文档 01 只改 status、不删 op 子键（记录留着排障）—— VM 侧的在岗判定
+    读的就是 status。
+    """
+    kvset(f"/sys/rwir-backend/{BACKEND}/status", "offline")
+    print(f"[backend] deregistered {BACKEND}", flush=True)
+
+
 def main():
     register()
-    queue = f"/sys/op/{BACKEND}/{INSTANCE}/cmd"
+    atexit.register(deregister)
+    queue = f"/sys/rwir-backend/{BACKEND}/cmd"
     print(f"[backend] watching {queue}", flush=True)
     fails = 0
     while True:

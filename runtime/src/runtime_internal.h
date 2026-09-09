@@ -24,6 +24,15 @@ extern void  kvspaceBytesFree(uint8_t *p, uint32_t len);
 extern int   kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
                          const uint32_t *lens, uint32_t n, char *err, uint32_t err_cap);
 extern int   kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len);
+
+typedef struct { uint32_t block_id; uint32_t gen; } kvspaceRef_t;
+extern int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref) __attribute__((weak));
+extern int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                           uint8_t **out, uint32_t *out_len) __attribute__((weak));
+extern int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                               uint32_t offset, const uint8_t *buf, uint32_t buf_len,
+                               char *err, uint32_t err_cap) __attribute__((weak));
+
 extern int   kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
                                uint32_t nnames, uint8_t **out, uint32_t *out_len);
 extern int   kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
@@ -70,7 +79,14 @@ typedef struct { uint8_t *data; uint32_t len; } kvlangXvalue_t;
 
 typedef struct { char *key; kvlangXvalue_t val; } kvlangKvPair_t;
 
-typedef struct { void *h; } kvlangKv_t;
+#define KVLANG_REF_CAP 64
+typedef struct { char *key; uint32_t block_id, gen; } kvlangRefEnt_t;
+typedef struct {
+    void *h;
+    kvlangRefEnt_t ref[KVLANG_REF_CAP];
+    int nref;
+    int ref_on;
+} kvlangKv_t;
 
 /* growable string buffer */
 typedef struct { char *p; size_t len, cap; } kvlangStrbuf_t;
@@ -137,6 +153,7 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
 int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, uint32_t err_cap);
 int kvlangKvDel(kvlangKv_t *k, const char *key, char *err, uint32_t err_cap);
 int kvlangKvDelTree(kvlangKv_t *k, const char *prefix, char *err, uint32_t err_cap);
+void kvlangKvInvalidateFrame(kvlangKv_t *k, const char *frame_root);
 int kvlangKvMkindex(kvlangKv_t *k, const char *path, char *err, uint32_t err_cap);
 int kvlangKvExtIndex(kvlangKv_t *k, const char *path, const char *ext, char *err, uint32_t err_cap);
 int kvlangKvDelExtIndex(kvlangKv_t *k, const char *path, char *err, uint32_t err_cap);

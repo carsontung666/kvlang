@@ -32,6 +32,9 @@ extern int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
 extern int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                                uint32_t offset, const uint8_t *buf, uint32_t buf_len,
                                char *err, uint32_t err_cap) __attribute__((weak));
+extern int kvspaceWriteInPlace(void *h, const char *key, int resolve,
+                               uint32_t body_len, uint8_t **body, char *err,
+                               uint32_t err_cap) __attribute__((weak));
 
 extern int   kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
                                uint32_t nnames, uint8_t **out, uint32_t *out_len);

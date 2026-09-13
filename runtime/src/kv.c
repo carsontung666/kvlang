@@ -123,6 +123,22 @@ int kvlangKvGetBatch(kvlangKv_t *k, const char *prefix, char **names, int n, kvl
 
 int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, uint32_t err_cap) {
     if (n <= 0) return 0;
+    if (n == 1 && pairs[0].key && pairs[0].val.data && kvspaceWriteInPlace) {
+        kvspaceHead_t hd;
+        int32_t blen = 0;
+        const uint8_t *src = NULL;
+        if (kvlangXvalueHead(&pairs[0].val, &hd) == 0)
+            src = kvlangXvalueBody(&pairs[0].val, &hd, &blen);
+        if (src && blen > 0) {
+            uint8_t *body = NULL;
+            if (kvspaceWriteInPlace(k->h, pairs[0].key, 0, (uint32_t)blen, &body,
+                                    err, err_cap) == 0 &&
+                body) {
+                memcpy(body, src, (size_t)blen);
+                return 0;
+            }
+        }
+    }
     if (n == 1 && ref_ok(k) && kvspaceSetPartByRef && pairs[0].key) {
         kvlangRefEnt_t *e = ref_find(k, pairs[0].key);
         if (e) {

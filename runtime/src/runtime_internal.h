@@ -80,7 +80,7 @@ void kvlang_kindexpr_parse(const uint8_t *kindexpr, kvlang_kindexpr_t *out);
 
 /* ── 基础类型 ──────────────────────────────────────────────────────── */
 
-typedef struct { uint8_t *data; uint32_t len; } kvlangXvalue_t;
+typedef struct { uint8_t *data; uint32_t len; int borrowed; } kvlangXvalue_t;
 
 typedef struct { char *key; kvlangXvalue_t val; } kvlangKvPair_t;
 
@@ -107,9 +107,9 @@ static inline void kvlangStrbufFree(kvlangStrbuf_t *b) { free(b->p); b->p = NULL
 /* ── XValue 操作 ───────────────────────────────────────────────────── */
 
 static inline bool kvlangXvalueNone(const kvlangXvalue_t *v) { return v->data == NULL || v->len == 0; }
-static inline void kvlangXvalueZero(kvlangXvalue_t *v) { v->data = NULL; v->len = 0; }
-void kvlangXvalueFree(kvlangXvalue_t *v);          /* kvspaceBytesFree */
-void kvlangXvalueSetBytes(kvlangXvalue_t *v, uint8_t *data, uint32_t len);  /* 接管内存 */
+static inline void kvlangXvalueZero(kvlangXvalue_t *v) { v->data = NULL; v->len = 0; v->borrowed = 0; }
+void kvlangXvalueFree(kvlangXvalue_t *v);
+void kvlangXvalueSetBytes(kvlangXvalue_t *v, uint8_t *data, uint32_t len);
 int  kvlangXvalueHead(const kvlangXvalue_t *v, kvspaceHead_t *h);                 /* decode head */
 const char *kvlangXvalueKind(const kvlangXvalue_t *v);                       /* 返回 kind，None="" */
 bool kvlangXvalueKindIs(const kvlangXvalue_t *v, const char *kind);

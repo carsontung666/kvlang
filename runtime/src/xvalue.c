@@ -8,12 +8,17 @@ static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); 
 static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32); }
 
 void kvlangXvalueFree(kvlangXvalue_t *v) {
-    free(v->data);
-    v->data = NULL; v->len = 0;
+    if (v->data && !v->borrowed)
+        free(v->data);
+    v->data = NULL;
+    v->len = 0;
+    v->borrowed = 0;
 }
 
 void kvlangXvalueSetBytes(kvlangXvalue_t *v, uint8_t *data, uint32_t len) {
-    v->data = data; v->len = len;
+    v->data = data;
+    v->len = len;
+    v->borrowed = 0;
 }
 
 /* 解析 kindexpr 内容 → (ref, dims, base kind)。kindexpr 为 NUL 终止串。 */

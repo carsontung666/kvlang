@@ -4,6 +4,7 @@
  * 后端由链接的 kvspace 库决定（kvspace-durable / kvspace-c 均导出同一 ABI）。 */
 
 static void kvlangXvalueCopyMalloc(kvlangXvalue_t *out, const uint8_t *d, uint32_t len) {
+    out->borrowed = 0;
     if (len > 0) {
         out->data = malloc(len);
         memcpy(out->data, d, len);
@@ -67,8 +68,9 @@ int kvlangKvGetOne(kvlangKv_t *k, const char *key, kvlangXvalue_t *out) {
     kvlangXvalueZero(out);
     uint8_t *d; uint32_t len;
     if (kvspaceGet(k->h, key, &d, &len) != 0) return -1;
-    kvlangXvalueCopyMalloc(out, d, len);
-    kvspaceBytesFree(d, len);
+    out->data = d;
+    out->len = len;
+    out->borrowed = 1;
     return 0;
 }
 
@@ -77,8 +79,10 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
     kvlangXvalueZero(out);
     if (!name || !name[0]) return 0;
     char key[2048];
-    if (ref_ok(k) && dir) {
+    key[0] = 0;
+    if (dir)
         snprintf(key, sizeof key, "%s%s", dir, name);
+    if (ref_ok(k) && key[0]) {
         kvlangRefEnt_t *e = ref_find(k, key);
         if (e) {
             kvspaceRef_t r = { e->block_id, e->gen };
@@ -86,10 +90,26 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
             if (kvspaceGetByRef(k->h, &r, key, &d, &len) == 0) {
                 e->block_id = r.block_id;
                 e->gen = r.gen;
-                kvlangXvalueCopyMalloc(out, d, len);
-                kvspaceBytesFree(d, len);
+                out->data = d;
+                out->len = len;
+                out->borrowed = 1;
                 return 0;
             }
+        }
+    }
+    if (key[0]) {
+        uint8_t *d;
+        uint32_t len;
+        if (kvspaceGet(k->h, key, &d, &len) == 0 && d && len) {
+            out->data = d;
+            out->len = len;
+            out->borrowed = 1;
+            if (ref_ok(k)) {
+                kvspaceRef_t r;
+                if (kvspaceResolveRef(k->h, key, &r) == 0)
+                    ref_put(k, key, &r);
+            }
+            return 0;
         }
     }
     char *nm = (char *)name;

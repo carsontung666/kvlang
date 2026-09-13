@@ -135,22 +135,32 @@ int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, ui
             }
         }
     }
-    const char **keys = malloc(sizeof(char *) * (size_t)n);
-    uint32_t *lens = malloc(sizeof(uint32_t) * (size_t)n);
-    size_t total = 0;
-    for (int i = 0; i < n; i++) {
-        keys[i] = pairs[i].key;
-        lens[i] = pairs[i].val.len;
-        total += pairs[i].val.len;
+    int rc;
+    if (n == 1) {
+        const char *key = pairs[0].key;
+        uint32_t len = pairs[0].val.len;
+        rc = kvspaceSet(k->h, &key, pairs[0].val.data, &len, 1, err, err_cap);
+    } else {
+        const char **keys = malloc(sizeof(char *) * (size_t)n);
+        uint32_t *lens = malloc(sizeof(uint32_t) * (size_t)n);
+        size_t total = 0;
+        for (int i = 0; i < n; i++) {
+            keys[i] = pairs[i].key;
+            lens[i] = pairs[i].val.len;
+            total += pairs[i].val.len;
+        }
+        uint8_t *vals = malloc(total ? total : 1);
+        size_t off = 0;
+        for (int i = 0; i < n; i++) {
+            if (pairs[i].val.len)
+                memcpy(vals + off, pairs[i].val.data, pairs[i].val.len);
+            off += pairs[i].val.len;
+        }
+        rc = kvspaceSet(k->h, keys, vals, lens, (uint32_t)n, err, err_cap);
+        free(keys);
+        free(lens);
+        free(vals);
     }
-    uint8_t *vals = malloc(total ? total : 1);
-    size_t off = 0;
-    for (int i = 0; i < n; i++) {
-        if (pairs[i].val.len) memcpy(vals + off, pairs[i].val.data, pairs[i].val.len);
-        off += pairs[i].val.len;
-    }
-    int rc = kvspaceSet(k->h, keys, vals, lens, (uint32_t)n, err, err_cap);
-    free(keys); free(lens); free(vals);
     if (rc == 0 && n == 1 && ref_ok(k) && pairs[0].key) {
         kvspaceRef_t r;
         if (kvspaceResolveRef(k->h, pairs[0].key, &r) == 0) ref_put(k, pairs[0].key, &r);

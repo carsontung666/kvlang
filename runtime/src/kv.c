@@ -168,6 +168,21 @@ int kvlangKvDelTree(kvlangKv_t *k, const char *prefix, char *err, uint32_t err_c
     return kvspaceDelTree(k->h, prefix, err, err_cap);
 }
 
+int kvlangKvCp(kvlangKv_t *k, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    if (!src || !dst)
+        return -1;
+    if (kvspaceCp)
+        return kvspaceCp(k->h, src, dst, err, err_cap);
+    kvlangXvalue_t v;
+    kvlangXvalueZero(&v);
+    if (kvlangKvGetOne(k, src, &v) != 0)
+        return -1;
+    kvlangKvPair_t p = { (char *)dst, v };
+    int rc = kvlangKvSet(k, &p, 1, err, err_cap);
+    kvlangXvalueFree(&v);
+    return rc;
+}
+
 int kvlangKvMkindex(kvlangKv_t *k, const char *path, char *err, uint32_t err_cap) {
     return kvspaceMkindex(k->h, path, err, err_cap);
 }

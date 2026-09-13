@@ -624,20 +624,69 @@ int kvlangBuiltinNative(kvlangFrame_t *f) {
 
 /* ── copy ─────────────────────────────────────────────────────────── */
 
+static char *copy_src_key(kvlangKv_t *kv, const char *frame_root, const char *name,
+                          const kvlangXvalue_t *val) {
+    if (val && !kvlangXvalueNone(val) && !kvlangXvalueKindIs(val, KVSPACE_KIND_RWIR) &&
+        !kvlangXvalueKindIs(val, KVSPACE_KIND_RWFUNC))
+        return NULL;
+    if (!name || !name[0])
+        return NULL;
+    if (name[0] == '/')
+        return strdup(name);
+    char *stk = kvlangKeytreeStack(frame_root);
+    kvlangXvalue_t pv;
+    kvlangXvalueZero(&pv);
+    kvlangKvGetMember(kv, stk, name, &pv);
+    char *src = NULL;
+    if (kvlangXvalueIsPtr(&pv)) {
+        char *target = kvlangXvaluePtrTarget(&pv);
+        kvlangXvalue_t av;
+        kvlangXvalueZero(&av);
+        kvlangKvGetMember(kv, stk, target, &av);
+        free(target);
+        if (!kvlangXvalueNone(&av))
+            src = kvlangXvalueValueString(&av);
+        kvlangXvalueFree(&av);
+    } else if (!kvlangXvalueNone(&pv)) {
+        size_t sl = strlen(stk), nl = strlen(name);
+        src = malloc(sl + nl + 1);
+        if (src) {
+            memcpy(src, stk, sl);
+            memcpy(src + sl, name, nl + 1);
+        }
+    }
+    kvlangXvalueFree(&pv);
+    free(stk);
+    return src;
+}
+
 int kvlangBuiltinExecuteCopy(kvlangKv_t *kv, const char *vtid, const char *pc, kvlangRwirInst_t *inst) {
     char *fr = kvlangKeytreeFrameRoot(pc);
     kvlangFrame_t f = { kv, vtid, pc, inst };
     if (inst->nr == 0) { free(fr); kvlangBuiltinNextPc(&f); return 0; }
-    kvlangXvalue_t v; kvlangXvalueZero(&v);
-    kvlangBuiltinResolveReadValue(kv, fr, inst->reads[0].name, &inst->reads[0].val, &v);
+    char *src = copy_src_key(kv, fr, inst->reads[0].name, &inst->reads[0].val);
+    kvlangXvalue_t v;
+    kvlangXvalueZero(&v);
+    int got = 0;
+    char err[256];
     for (int i = 0; i < inst->nw; i++) {
         char *key = kvlangBuiltinResolveWriteSlot(kv, fr, inst->writes[i].name);
-        kvlangKvPair_t pair = { key, v };
-        char err[256];
-        kvlangKvSet(kv, &pair, 1, err, sizeof err);
+        int copied = 0;
+        if (src && key)
+            copied = kvlangKvCp(kv, src, key, err, sizeof err) == 0;
+        if (!copied) {
+            if (!got) {
+                kvlangBuiltinResolveReadValue(kv, fr, inst->reads[0].name, &inst->reads[0].val, &v);
+                got = 1;
+            }
+            kvlangKvPair_t pair = { key, v };
+            kvlangKvSet(kv, &pair, 1, err, sizeof err);
+        }
         free(key);
     }
-    kvlangXvalueFree(&v);
+    if (got)
+        kvlangXvalueFree(&v);
+    free(src);
     free(fr);
     kvlangBuiltinNextPc(&f);
     return 0;

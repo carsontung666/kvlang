@@ -66,9 +66,15 @@ def _needs_skip(f: Path) -> bool:
 
 
 def _flush_redis() -> None:
+    port = "6379"
+    if _C_DSN.startswith("redis://"):
+        rest = _C_DSN[len("redis://"):]
+        rest = rest.split("/", 1)[0]
+        if ":" in rest:
+            port = rest.rsplit(":", 1)[-1]
     try:
         subprocess.run(
-            ["redis-cli", "-p", "6379", "FLUSHALL"],
+            ["redis-cli", "-p", port, "FLUSHALL"],
             capture_output=True, timeout=5,
         )
     except FileNotFoundError:
@@ -141,8 +147,20 @@ def _benchmark_file(f: Path, expects: list[str]) -> tuple[dict[str, str], str]:
             return invalid, "C compilation failed"
 
         try:
-            _flush_redis()
-            kv_result, kv_ms = _timed_run([KV, rel], env=_KV_ENV)
+            if _C_DSN.startswith("shm://"):
+                path = _C_DSN[len("shm://"):]
+                for p in (path, path + ".sbo.head", path + ".sbo.data"):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+            elif _C_DSN.startswith("fs://"):
+                shutil.rmtree(_C_DSN[len("fs://"):], ignore_errors=True)
+            else:
+                _flush_redis()
+            kv_result, kv_ms = _timed_run(
+                [TERM_BIN, rel], env={**_KV_ENV, "KVSPACE": _C_DSN},
+            )
             py_result, py_ms = _timed_run([sys.executable, str(f.with_suffix(".py"))])
             c_result, c_ms = _timed_run([str(executable)])
         except FileNotFoundError as exc:
@@ -195,21 +213,18 @@ def _run_test_file(f: Path, expects: list[str], env: dict) -> tuple[bool, str]:
     """Rust layout → kvspace(dsn) → runtime（bin/kvlang，链 C ABI），检查输出。"""
     rel = str(f.relative_to(ROOT))
     if _C_DSN.startswith("shm://"):
-        try:
-            os.unlink(_C_DSN[len("shm://"):])
-        except OSError:
-            pass
+        path = _C_DSN[len("shm://"):]
+        for p in (path, path + ".sbo.head", path + ".sbo.data"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
     elif _C_DSN.startswith("fs://"):
         shutil.rmtree(_C_DSN[len("fs://"):], ignore_errors=True)
     else:
         _flush_redis()
-    layout = subprocess.run([LAYOUT_BIN, rel, _C_DSN], capture_output=True, text=True,
-                            timeout=60, cwd=str(ROOT), env=env)
-    if layout.returncode != 0:
-        return False, f"layout failed: {layout.stderr.strip()[:100]}"
-    entry = "test"  # 约定入口：每个 tutorial 顶层 rwfunc test()（pkg 空、裸名）
     try:
-        crun = subprocess.run([TERM_BIN, entry], capture_output=True, text=True,
+        crun = subprocess.run([TERM_BIN, rel], capture_output=True, text=True,
                               timeout=120, cwd=str(ROOT), env={**env, "KVSPACE": _C_DSN})
     except subprocess.TimeoutExpired:
         return False, "timeout"

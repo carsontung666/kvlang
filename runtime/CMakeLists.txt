@@ -16,7 +16,14 @@ target_include_directories(kvlang_runtime PUBLIC include src)
 target_compile_definitions(kvlang_runtime PRIVATE _GNU_SOURCE)
 
 # 链接 kvspace dispatch 前端（已安装 /usr/lib），运行期按 DSN 选后端，编译期不再选后端。
-target_link_libraries(kvlang_runtime PRIVATE kvspace m pthread)
+target_link_libraries(kvlang_runtime PRIVATE kvspace m pthread dl)
 
 # --export-dynamic 供 kvlang（term 扩展）找符号；--disable-new-dtags 使 rpath 转 DT_RPATH（传递）。
 set_target_properties(kvlang_runtime PROPERTIES LINK_FLAGS "-Wl,--export-dynamic -Wl,--disable-new-dtags")
+
+add_executable(test_kv_cp tests/test_kv_cp.c)
+target_include_directories(test_kv_cp PRIVATE include src)
+target_link_libraries(test_kv_cp PRIVATE kvlang_runtime kvspace)
+set_target_properties(test_kv_cp PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIR}"
+    LINK_FLAGS "-Wl,--disable-new-dtags")

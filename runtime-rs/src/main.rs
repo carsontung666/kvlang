@@ -273,8 +273,12 @@ fn boot(dsn: &str) -> Engine {
         ext: None,
     };
     eng.register();
-    let inits = eng.layout_stdlib();
-    eng.run_inits(&inits);
+    // Re-layout of stdlib onto a shm that already has a program (kvlanglayout
+    // then `kvlang test`) livelocks in sbo_alloc. Skip if math constants exist.
+    if eng.get_kv("/lib/math·Pi").is_empty() {
+        let inits = eng.layout_stdlib();
+        eng.run_inits(&inits);
+    }
     eng
 }
 

@@ -91,6 +91,7 @@ typedef struct {
     kvlangRefEnt_t ref[KVLANG_REF_CAP];
     int nref;
     int ref_on;
+    int borrow_get; /* -1 unknown, 1 live shm view, 0 malloc copy */
 } kvlangKv_t;
 
 /* growable string buffer */

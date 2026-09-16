@@ -1,4 +1,5 @@
 #include "runtime_internal.h"
+#include <dlfcn.h>
 
 /* kv 访问统一走 kvspace-durable 兼容 C ABI（kvspace*）。
  * 后端由链接的 kvspace 库决定（kvspace-durable / kvspace-c 均导出同一 ABI）。 */
@@ -49,11 +50,59 @@ void kvlangKvInvalidateFrame(kvlangKv_t *k, const char *fr) {
     k->nref = w;
 }
 
+typedef uint8_t *(*kvlang_shm_get_fn)(void *, const char *, int, int32_t *);
+
+static kvlang_shm_get_fn shm_get_fn;
+static int shm_get_tried;
+
+/* Live shm mapping (not malloc). NULL if this backend has no kvspaceShmGet. */
+static uint8_t *shm_borrow_get(void *h, const char *key, uint32_t *out_len) {
+    if (!h || !key || !out_len)
+        return NULL;
+    if (!shm_get_tried) {
+        shm_get_tried = 1;
+        void *so = dlopen("libkvspace-c.so.1", RTLD_NOLOAD | RTLD_LAZY);
+        if (so)
+            shm_get_fn = (kvlang_shm_get_fn)dlsym(so, "kvspaceShmGet");
+    }
+    if (!shm_get_fn)
+        return NULL;
+    void *bkv = *(void **)((char *)h + 16);
+    if (!bkv)
+        return NULL;
+    int32_t n = 0;
+    uint8_t *d = shm_get_fn(bkv, key, 0, &n);
+    if (!d || n <= 0)
+        return NULL;
+    *out_len = (uint32_t)n;
+    return d;
+}
+
+/* kvspaceGet / GetByRef buffers are process-owned malloc; never borrowed. */
+static void take_owned(uint8_t *d, uint32_t len, kvlangXvalue_t *out) {
+    kvlangXvalueCopyMalloc(out, d, len);
+    if (d)
+        kvspaceBytesFree(d, len);
+}
+
+static int take_shm_view(kvlangKv_t *k, const char *key, kvlangXvalue_t *out) {
+    uint32_t len = 0;
+    uint8_t *d = shm_borrow_get(k->h, key, &len);
+    if (!d)
+        return 0;
+    k->borrow_get = 1;
+    out->data = d;
+    out->len = len;
+    out->borrowed = 1;
+    return 1;
+}
+
 kvlangKv_t *kvlangKvConnect(const char *dsn) {
     kvlangKv_t *k = calloc(1, sizeof(*k));
     k->h = kvspaceConnect(dsn);
     if (!k->h) { free(k); return NULL; }
     k->ref_on = 1;
+    k->borrow_get = -1; /* unknown until first Get */
     return k;
 }
 
@@ -66,11 +115,12 @@ void kvlangKvDisconnect(kvlangKv_t *k) {
 
 int kvlangKvGetOne(kvlangKv_t *k, const char *key, kvlangXvalue_t *out) {
     kvlangXvalueZero(out);
-    uint8_t *d; uint32_t len;
+    if (take_shm_view(k, key, out))
+        return 0;
+    uint8_t *d = NULL;
+    uint32_t len = 0;
     if (kvspaceGet(k->h, key, &d, &len) != 0) return -1;
-    out->data = d;
-    out->len = len;
-    out->borrowed = 1;
+    take_owned(d, len, out);
     return 0;
 }
 
@@ -82,6 +132,14 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
     key[0] = 0;
     if (dir)
         snprintf(key, sizeof key, "%s%s", dir, name);
+    if (key[0] && take_shm_view(k, key, out)) {
+        if (ref_ok(k)) {
+            kvspaceRef_t r;
+            if (kvspaceResolveRef(k->h, key, &r) == 0)
+                ref_put(k, key, &r);
+        }
+        return 0;
+    }
     if (ref_ok(k) && key[0]) {
         kvlangRefEnt_t *e = ref_find(k, key);
         if (e) {
@@ -90,9 +148,7 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
             if (kvspaceGetByRef(k->h, &r, key, &d, &len) == 0) {
                 e->block_id = r.block_id;
                 e->gen = r.gen;
-                out->data = d;
-                out->len = len;
-                out->borrowed = 1;
+                take_owned(d, len, out);
                 return 0;
             }
         }
@@ -101,9 +157,7 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
         uint8_t *d;
         uint32_t len;
         if (kvspaceGet(k->h, key, &d, &len) == 0 && d && len) {
-            out->data = d;
-            out->len = len;
-            out->borrowed = 1;
+            take_owned(d, len, out);
             if (ref_ok(k)) {
                 kvspaceRef_t r;
                 if (kvspaceResolveRef(k->h, key, &r) == 0)
@@ -141,21 +195,73 @@ int kvlangKvGetBatch(kvlangKv_t *k, const char *prefix, char **names, int n, kvl
     return 0;
 }
 
+/* True if key is an ART leaf (not an extindex fallback to another tree). */
+static int key_has_own_node(kvlangKv_t *k, const char *key) {
+    if (!k || !key || !key[0])
+        return 0;
+    const char *slash = strrchr(key, '/');
+    if (!slash)
+        return 0;
+    char parent[2048];
+    size_t n = (size_t)(slash - key + 1);
+    if (n >= sizeof parent)
+        return 0;
+    memcpy(parent, key, n);
+    parent[n] = 0;
+    const char *name = slash + 1;
+    if (!name[0])
+        return 0;
+    char **names = NULL;
+    int count = 0;
+    if (kvlangKvList(k, parent, false, false, &names, &count) != 0)
+        return 0;
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (!found && names[i] && strcmp(names[i], name) == 0)
+            found = 1;
+        free(names[i]);
+    }
+    free(names);
+    return found;
+}
+
 int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, uint32_t err_cap) {
     if (n <= 0) return 0;
-    if (n == 1 && pairs[0].key && pairs[0].val.data && kvspaceWriteInPlace) {
+    if (n == 1 && pairs[0].key && pairs[0].val.data) {
         kvspaceHead_t hd;
         int32_t blen = 0;
         const uint8_t *src = NULL;
         if (kvlangXvalueHead(&pairs[0].val, &hd) == 0)
             src = kvlangXvalueBody(&pairs[0].val, &hd, &blen);
         if (src && blen > 0) {
-            uint8_t *body = NULL;
-            if (kvspaceWriteInPlace(k->h, pairs[0].key, 0, (uint32_t)blen, &body,
-                                    err, err_cap) == 0 &&
-                body) {
-                memcpy(body, src, (size_t)blen);
-                return 0;
+            if (kvspaceWriteInPlace) {
+                uint8_t *body = NULL;
+                if (kvspaceWriteInPlace(k->h, pairs[0].key, 0, (uint32_t)blen, &body,
+                                        err, err_cap) == 0 &&
+                    body) {
+                    memcpy(body, src, (size_t)blen);
+                    return 0;
+                }
+            }
+            /* Borrowed Get follows extindex; memcpy would punch through into
+             * shared /lib IR. Only in-place when this key already has its own node. */
+            if (k->borrow_get > 0 && key_has_own_node(k, pairs[0].key)) {
+                kvlangXvalue_t cur;
+                kvlangXvalueZero(&cur);
+                if (kvlangKvGetOne(k, pairs[0].key, &cur) == 0 && cur.borrowed &&
+                    cur.data) {
+                    kvspaceHead_t hd_cur;
+                    int32_t oldb = 0;
+                    uint8_t *dst = NULL;
+                    if (kvlangXvalueHead(&cur, &hd_cur) == 0)
+                        dst = (uint8_t *)kvlangXvalueBody(&cur, &hd_cur, &oldb);
+                    if (dst && oldb == blen) {
+                        memcpy(dst, src, (size_t)blen);
+                        kvlangXvalueFree(&cur);
+                        return 0;
+                    }
+                }
+                kvlangXvalueFree(&cur);
             }
         }
     }

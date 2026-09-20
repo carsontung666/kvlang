@@ -1,8 +1,7 @@
 #include "runtime_internal.h"
 #include <dlfcn.h>
 
-/* kv 访问统一走 kvspace-durable 兼容 C ABI（kvspace*）。
- * 后端由链接的 kvspace 库决定（kvspace-durable / kvspace-c 均导出同一 ABI）。 */
+/* kvspace* C ABI. */
 
 static void kvlangXvalueCopyMalloc(kvlangXvalue_t *out, const uint8_t *d, uint32_t len) {
     out->borrowed = 0;
@@ -30,6 +29,22 @@ static void ref_put(kvlangKv_t *k, const char *key, const kvspaceRef_t *r) {
     e->gen = r->gen;
 }
 
+static void ref_drop(kvlangKv_t *k, const char *key) {
+    if (!k || !key)
+        return;
+    int w = 0;
+    for (int i = 0; i < k->nref; i++) {
+        if (k->ref[i].key && strcmp(k->ref[i].key, key) == 0) {
+            free(k->ref[i].key);
+            continue;
+        }
+        if (w != i)
+            k->ref[w] = k->ref[i];
+        w++;
+    }
+    k->nref = w;
+}
+
 static int ref_ok(kvlangKv_t *k) {
     return k->ref_on && kvspaceResolveRef && kvspaceGetByRef;
 }
@@ -51,34 +66,63 @@ void kvlangKvInvalidateFrame(kvlangKv_t *k, const char *fr) {
 }
 
 typedef uint8_t *(*kvlang_shm_get_fn)(void *, const char *, int, int32_t *);
+typedef int (*kvlang_shm_resolve_fn)(void *, const char *, uint32_t *, uint32_t *);
+typedef uint8_t *(*kvlang_shm_get_by_ref_fn)(void *, uint32_t *, uint32_t *,
+                                            const char *, int32_t *);
+typedef int (*kvlang_shm_set_part_fn)(void *, uint32_t *, uint32_t *, const char *,
+                                     uint32_t, const uint8_t *, uint32_t);
+typedef int (*kvlang_shm_set_fn)(void *, const char *, const uint8_t *, int32_t);
+typedef int (*kvlang_shm_cptree_fn)(void *, const char *, const char *);
 
 static kvlang_shm_get_fn shm_get_fn;
-static int shm_get_tried;
+static kvlang_shm_resolve_fn shm_resolve_fn;
+static kvlang_shm_get_by_ref_fn shm_get_by_ref_fn;
+static kvlang_shm_set_part_fn shm_set_part_fn;
+static kvlang_shm_set_fn shm_set_fn;
+static kvlang_shm_cptree_fn shm_cptree_fn;
+static int shm_bind_tried;
 
-/* Live shm mapping (not malloc). NULL if this backend has no kvspaceShmGet. */
-static uint8_t *shm_borrow_get(void *h, const char *key, uint32_t *out_len) {
-    if (!h || !key || !out_len)
-        return NULL;
-    if (!shm_get_tried) {
-        shm_get_tried = 1;
-        void *so = dlopen("libkvspace-c.so.1", RTLD_NOLOAD | RTLD_LAZY);
-        if (so)
-            shm_get_fn = (kvlang_shm_get_fn)dlsym(so, "kvspaceShmGet");
-    }
-    if (!shm_get_fn)
-        return NULL;
-    void *bkv = *(void **)((char *)h + 16);
-    if (!bkv)
-        return NULL;
-    int32_t n = 0;
-    uint8_t *d = shm_get_fn(bkv, key, 0, &n);
-    if (!d || n <= 0)
-        return NULL;
-    *out_len = (uint32_t)n;
-    return d;
+static void shm_bind(void) {
+    if (shm_bind_tried)
+        return;
+    shm_bind_tried = 1;
+    void *so = dlopen("libkvspace-c.so.1", RTLD_NOLOAD | RTLD_LAZY);
+    if (!so)
+        so = dlopen("libkvspace-c.so", RTLD_NOLOAD | RTLD_LAZY);
+    if (!so)
+        return;
+    shm_get_fn = (kvlang_shm_get_fn)dlsym(so, "kvspaceShmGet");
+    shm_resolve_fn = (kvlang_shm_resolve_fn)dlsym(so, "kvspaceShmResolveRef");
+    shm_get_by_ref_fn = (kvlang_shm_get_by_ref_fn)dlsym(so, "kvspaceShmGetByRef");
+    shm_set_part_fn = (kvlang_shm_set_part_fn)dlsym(so, "kvspaceShmSetPartByRef");
+    shm_set_fn = (kvlang_shm_set_fn)dlsym(so, "kvspaceShmSet");
+    shm_cptree_fn = (kvlang_shm_cptree_fn)dlsym(so, "kvspaceShmCptree");
 }
 
-/* kvspaceGet / GetByRef buffers are process-owned malloc; never borrowed. */
+static void *shm_backend(void *h) {
+    return h ? *(void **)((char *)h + 16) : NULL;
+}
+
+static void ref_cache_key(kvlangKv_t *k, const char *key) {
+    if (!k || !k->ref_on || !key || !key[0] || ref_find(k, key))
+        return;
+    shm_bind();
+    void *bkv = shm_backend(k->h);
+    if (bkv && shm_resolve_fn) {
+        uint32_t bid = 0, gen = 0;
+        if (shm_resolve_fn(bkv, key, &bid, &gen) == 0) {
+            kvspaceRef_t r = { bid, gen };
+            ref_put(k, key, &r);
+        }
+        return;
+    }
+    if (kvspaceResolveRef) {
+        kvspaceRef_t r;
+        if (kvspaceResolveRef(k->h, key, &r) == 0)
+            ref_put(k, key, &r);
+    }
+}
+
 static void take_owned(uint8_t *d, uint32_t len, kvlangXvalue_t *out) {
     kvlangXvalueCopyMalloc(out, d, len);
     if (d)
@@ -86,13 +130,41 @@ static void take_owned(uint8_t *d, uint32_t len, kvlangXvalue_t *out) {
 }
 
 static int take_shm_view(kvlangKv_t *k, const char *key, kvlangXvalue_t *out) {
-    uint32_t len = 0;
-    uint8_t *d = shm_borrow_get(k->h, key, &len);
+    if (!k || !key)
+        return 0;
+    shm_bind();
+    void *bkv = shm_backend(k->h);
+    if (!bkv)
+        return 0;
+    int32_t n = 0;
+    uint8_t *d = NULL;
+    kvlangRefEnt_t *e = ref_find(k, key);
+    if (e && shm_get_by_ref_fn) {
+        uint32_t bid = e->block_id, gen = e->gen;
+        d = shm_get_by_ref_fn(bkv, &bid, &gen, key, &n);
+        if (d && n > 0) {
+            e->block_id = bid;
+            e->gen = gen;
+        } else {
+            d = NULL;
+            n = 0;
+            ref_drop(k, key);
+        }
+    }
+    if (!d && shm_get_fn) {
+        d = shm_get_fn(bkv, key, 0, &n);
+        if (!d || n <= 0) {
+            d = NULL;
+            n = 0;
+        } else {
+            ref_cache_key(k, key);
+        }
+    }
     if (!d)
         return 0;
     k->borrow_get = 1;
     out->data = d;
-    out->len = len;
+    out->len = (uint32_t)n;
     out->borrowed = 1;
     return 1;
 }
@@ -117,10 +189,26 @@ int kvlangKvGetOne(kvlangKv_t *k, const char *key, kvlangXvalue_t *out) {
     kvlangXvalueZero(out);
     if (take_shm_view(k, key, out))
         return 0;
+    if (ref_ok(k) && key) {
+        kvlangRefEnt_t *e = ref_find(k, key);
+        if (e) {
+            kvspaceRef_t r = { e->block_id, e->gen };
+            uint8_t *d;
+            uint32_t len;
+            if (kvspaceGetByRef(k->h, &r, key, &d, &len) == 0 && d && len) {
+                e->block_id = r.block_id;
+                e->gen = r.gen;
+                take_owned(d, len, out);
+                return 0;
+            }
+            ref_drop(k, key);
+        }
+    }
     uint8_t *d = NULL;
     uint32_t len = 0;
     if (kvspaceGet(k->h, key, &d, &len) != 0) return -1;
     take_owned(d, len, out);
+    ref_cache_key(k, key);
     return 0;
 }
 
@@ -132,25 +220,20 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
     key[0] = 0;
     if (dir)
         snprintf(key, sizeof key, "%s%s", dir, name);
-    if (key[0] && take_shm_view(k, key, out)) {
-        if (ref_ok(k)) {
-            kvspaceRef_t r;
-            if (kvspaceResolveRef(k->h, key, &r) == 0)
-                ref_put(k, key, &r);
-        }
+    if (key[0] && take_shm_view(k, key, out))
         return 0;
-    }
     if (ref_ok(k) && key[0]) {
         kvlangRefEnt_t *e = ref_find(k, key);
         if (e) {
             kvspaceRef_t r = { e->block_id, e->gen };
             uint8_t *d; uint32_t len;
-            if (kvspaceGetByRef(k->h, &r, key, &d, &len) == 0) {
+            if (kvspaceGetByRef(k->h, &r, key, &d, &len) == 0 && d && len) {
                 e->block_id = r.block_id;
                 e->gen = r.gen;
                 take_owned(d, len, out);
                 return 0;
             }
+            ref_drop(k, key);
         }
     }
     if (key[0]) {
@@ -158,20 +241,14 @@ int kvlangKvGetMember(kvlangKv_t *k, const char *dir, const char *name, kvlangXv
         uint32_t len;
         if (kvspaceGet(k->h, key, &d, &len) == 0 && d && len) {
             take_owned(d, len, out);
-            if (ref_ok(k)) {
-                kvspaceRef_t r;
-                if (kvspaceResolveRef(k->h, key, &r) == 0)
-                    ref_put(k, key, &r);
-            }
+            ref_cache_key(k, key);
             return 0;
         }
     }
     char *nm = (char *)name;
     int rc = kvlangKvGetBatch(k, dir, &nm, 1, out);
-    if (rc == 0 && !kvlangXvalueNone(out) && ref_ok(k) && dir) {
-        kvspaceRef_t r;
-        if (kvspaceResolveRef(k->h, key, &r) == 0) ref_put(k, key, &r);
-    }
+    if (rc == 0 && !kvlangXvalueNone(out) && key[0])
+        ref_cache_key(k, key);
     return rc;
 }
 
@@ -195,93 +272,82 @@ int kvlangKvGetBatch(kvlangKv_t *k, const char *prefix, char **names, int n, kvl
     return 0;
 }
 
-/* True if key is an ART leaf (not an extindex fallback to another tree). */
 static int key_has_own_node(kvlangKv_t *k, const char *key) {
     if (!k || !key || !key[0])
         return 0;
-    const char *slash = strrchr(key, '/');
-    if (!slash)
-        return 0;
-    char parent[2048];
-    size_t n = (size_t)(slash - key + 1);
-    if (n >= sizeof parent)
-        return 0;
-    memcpy(parent, key, n);
-    parent[n] = 0;
-    const char *name = slash + 1;
-    if (!name[0])
-        return 0;
-    char **names = NULL;
-    int count = 0;
-    if (kvlangKvList(k, parent, false, false, &names, &count) != 0)
-        return 0;
-    int found = 0;
-    for (int i = 0; i < count; i++) {
-        if (!found && names[i] && strcmp(names[i], name) == 0)
-            found = 1;
-        free(names[i]);
-    }
-    free(names);
-    return found;
+    if (ref_find(k, key))
+        return 1;
+    ref_cache_key(k, key);
+    return ref_find(k, key) != NULL;
 }
 
 int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, uint32_t err_cap) {
     if (n <= 0) return 0;
+    if (n == 1 && pairs[0].key && (pairs[0].val.data == NULL || pairs[0].val.len == 0))
+        return kvlangKvDel(k, pairs[0].key, err, err_cap);
     if (n == 1 && pairs[0].key && pairs[0].val.data) {
+        const char *key = pairs[0].key;
         kvspaceHead_t hd;
         int32_t blen = 0;
         const uint8_t *src = NULL;
         if (kvlangXvalueHead(&pairs[0].val, &hd) == 0)
             src = kvlangXvalueBody(&pairs[0].val, &hd, &blen);
-        if (src && blen > 0) {
-            if (kvspaceWriteInPlace) {
-                uint8_t *body = NULL;
-                if (kvspaceWriteInPlace(k->h, pairs[0].key, 0, (uint32_t)blen, &body,
-                                        err, err_cap) == 0 &&
-                    body) {
-                    memcpy(body, src, (size_t)blen);
-                    return 0;
-                }
+        shm_bind();
+        void *bkv = shm_backend(k->h);
+        kvlangRefEnt_t *e = ref_find(k, key);
+        if (!e && key_has_own_node(k, key))
+            e = ref_find(k, key);
+        if (e && bkv && shm_set_part_fn) {
+            uint32_t bid = e->block_id, gen = e->gen;
+            if (shm_set_part_fn(bkv, &bid, &gen, key, 0, pairs[0].val.data,
+                                pairs[0].val.len) == 0) {
+                e->block_id = bid;
+                e->gen = gen;
+                return 0;
             }
-            /* Borrowed Get follows extindex; memcpy would punch through into
-             * shared /lib IR. Only in-place when this key already has its own node. */
-            if (k->borrow_get > 0 && key_has_own_node(k, pairs[0].key)) {
-                kvlangXvalue_t cur;
-                kvlangXvalueZero(&cur);
-                if (kvlangKvGetOne(k, pairs[0].key, &cur) == 0 && cur.borrowed &&
-                    cur.data) {
-                    kvspaceHead_t hd_cur;
-                    int32_t oldb = 0;
-                    uint8_t *dst = NULL;
-                    if (kvlangXvalueHead(&cur, &hd_cur) == 0)
-                        dst = (uint8_t *)kvlangXvalueBody(&cur, &hd_cur, &oldb);
-                    if (dst && oldb == blen) {
-                        memcpy(dst, src, (size_t)blen);
-                        kvlangXvalueFree(&cur);
-                        return 0;
-                    }
-                }
-                kvlangXvalueFree(&cur);
-            }
+            ref_drop(k, key);
+            e = NULL;
         }
-    }
-    if (n == 1 && ref_ok(k) && kvspaceSetPartByRef && pairs[0].key) {
-        kvlangRefEnt_t *e = ref_find(k, pairs[0].key);
-        if (e) {
+        if (e && kvspaceSetPartByRef) {
             kvspaceRef_t r = { e->block_id, e->gen };
-            if (kvspaceSetPartByRef(k->h, &r, pairs[0].key, 0, pairs[0].val.data,
+            if (kvspaceSetPartByRef(k->h, &r, key, 0, pairs[0].val.data,
                                     pairs[0].val.len, err, err_cap) == 0) {
                 e->block_id = r.block_id;
                 e->gen = r.gen;
                 return 0;
             }
+            ref_drop(k, key);
+            e = NULL;
+        }
+        if (k->borrow_get > 0 && e) {
+            kvlangXvalue_t cur;
+            kvlangXvalueZero(&cur);
+            if (kvlangKvGetOne(k, key, &cur) == 0 && cur.borrowed && cur.data) {
+                kvspaceHead_t hd_cur;
+                int32_t oldb = 0;
+                uint8_t *dst = NULL;
+                if (kvlangXvalueHead(&cur, &hd_cur) == 0)
+                    dst = (uint8_t *)kvlangXvalueBody(&cur, &hd_cur, &oldb);
+                if (dst && src && oldb == blen) {
+                    memcpy(dst, src, (size_t)blen);
+                    kvlangXvalueFree(&cur);
+                    return 0;
+                }
+            }
+            kvlangXvalueFree(&cur);
         }
     }
     int rc;
     if (n == 1) {
         const char *key = pairs[0].key;
         uint32_t len = pairs[0].val.len;
-        rc = kvspaceSet(k->h, &key, pairs[0].val.data, &len, 1, err, err_cap);
+        shm_bind();
+        void *bkv = shm_backend(k->h);
+        if (bkv && shm_set_fn && key && pairs[0].val.data &&
+            shm_set_fn(bkv, key, pairs[0].val.data, (int32_t)len) == 0)
+            rc = 0;
+        else
+            rc = kvspaceSet(k->h, &key, pairs[0].val.data, &len, 1, err, err_cap);
     } else {
         const char **keys = malloc(sizeof(char *) * (size_t)n);
         uint32_t *lens = malloc(sizeof(uint32_t) * (size_t)n);
@@ -303,14 +369,13 @@ int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, ui
         free(lens);
         free(vals);
     }
-    if (rc == 0 && n == 1 && ref_ok(k) && pairs[0].key) {
-        kvspaceRef_t r;
-        if (kvspaceResolveRef(k->h, pairs[0].key, &r) == 0) ref_put(k, pairs[0].key, &r);
-    }
+    if (rc == 0 && n == 1 && pairs[0].key)
+        ref_cache_key(k, pairs[0].key);
     return rc;
 }
 
 int kvlangKvDel(kvlangKv_t *k, const char *key, char *err, uint32_t err_cap) {
+    ref_drop(k, key);
     const char *keys[1] = { key };
     return kvspaceDel(k->h, keys, 1, err, err_cap);
 }
@@ -336,12 +401,29 @@ int kvlangKvCp(kvlangKv_t *k, const char *src, const char *dst, char *err, uint3
         kvlangXvalueFree(&v);
         return rc;
     }
-    if (rc == 0 && ref_ok(k)) {
-        kvspaceRef_t r;
-        if (kvspaceResolveRef(k->h, dst, &r) == 0)
-            ref_put(k, dst, &r);
-    }
+    if (rc == 0)
+        ref_cache_key(k, dst);
     return rc;
+}
+
+int kvlangKvCpTree(kvlangKv_t *k, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    if (!src || !dst)
+        return -1;
+    shm_bind();
+    void *bkv = shm_backend(k->h);
+    if (bkv && shm_cptree_fn) {
+        int rc = shm_cptree_fn(bkv, src, dst);
+        if (rc == 0)
+            kvlangKvInvalidateFrame(k, dst);
+        return rc;
+    }
+    if (kvspaceCpTree) {
+        int rc = kvspaceCpTree(k->h, src, dst, err, err_cap);
+        if (rc == 0)
+            kvlangKvInvalidateFrame(k, dst);
+        return rc;
+    }
+    return kvlangKvCp(k, src, dst, err, err_cap);
 }
 
 int kvlangKvMkindex(kvlangKv_t *k, const char *path, char *err, uint32_t err_cap) {

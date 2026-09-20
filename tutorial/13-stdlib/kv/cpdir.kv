@@ -1,0 +1,14 @@
+// kv·cpdir：拷贝 key 子树，改 src 子节点不影响 dst
+// 期望输出:
+//   child: 1
+//   after: 1
+
+rwfunc test() -> () {
+	kv·set("/cptree/a", 1)
+	kv·cpdir("/cptree", "/cptree2")
+	v <- kv·get("/cptree2/a")
+	println("child:", v)
+	kv·set("/cptree/a", 9)
+	v2 <- kv·get("/cptree2/a")
+	println("after:", v2)
+}

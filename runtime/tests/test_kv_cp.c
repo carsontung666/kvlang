@@ -61,6 +61,19 @@ int main(void) {
     if (!kv)
         return 1;
 
+    {
+        kvlangXvalue_t z;
+        kvlangXvalueZero(&z);
+        kvlangXvalueNewInt64(&z, 10);
+        CHECK(z.len == (uint32_t)KVLANG_XVALUE_HEADLEN + 8, "int64 box is 64+8, got %u", z.len);
+        CHECK(z.data && z.data[1] == 1, "ATOM storetype at byte 1");
+        CHECK(kvlangXvalueAsInt64(&z) == 10, "AsInt64 reads body at +64");
+        CHECK(z.data[KVLANG_XVALUE_HEADLEN] == 10, "payload first byte");
+        kvlangXvalueFree(&z);
+        if (failures == 0)
+            fprintf(stdout, "ok head64_encode\n");
+    }
+
     CHECK(set_i64(kv, "/src", 10) == 0, "seed /src");
     char err[128] = {0};
     CHECK(kvlangKvCp(kv, "/src", "/dst", err, sizeof err) == 0, "cp /src /dst (%s)",
@@ -86,9 +99,20 @@ int main(void) {
     CHECK(view.borrowed, "held view still borrowed");
     CHECK(kvlangXvalueAsInt64(&view) == 2, "held view sees in-place body write");
     CHECK(get_i64(kv, "/k") == 2, "get after in-place");
+    CHECK(view.len == (uint32_t)KVLANG_XVALUE_HEADLEN + 8, "borrowed box 72");
     kvlangXvalueFree(&view);
     if (failures == 0)
         fprintf(stdout, "ok borrow_inplace\n");
+
+    CHECK(set_i64(kv, "/acc", 0) == 0, "seed /acc");
+    for (int i = 0; i < 10000; i++) {
+        int64_t cur = get_i64(kv, "/acc");
+        if (set_i64(kv, "/acc", cur + 1) != 0)
+            break;
+    }
+    CHECK(get_i64(kv, "/acc") == 10000, "10000 in-place increments via Set");
+    if (failures == 0)
+        fprintf(stdout, "ok hot_inc_10000\n");
 
     kvlangKvDisconnect(kv);
     fprintf(stdout, "%d FAIL\n", failures);

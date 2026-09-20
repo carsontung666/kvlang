@@ -179,3 +179,29 @@ bool kvlangKeytreeIsEntryPc(const char *pc) {
     const char *slash = strrchr(pc, '/');
     return slash && strcmp(slash, "/[1,0]") == 0;
 }
+
+int kvlangKeytreeParsePc(const char *pc, int *d, int *irseq) {
+    if (!pc || !d || !irseq) return -1;
+    const char *a = NULL, *b = NULL;
+    for (const char *p = pc; (p = strstr(p, "/[")) != NULL; p += 2) {
+        a = b;
+        b = p;
+    }
+    if (!b) return -1;
+    if (a) {
+        *d = atoi(a + 2);
+        *irseq = atoi(b + 2);
+    } else {
+        *d = 1;
+        *irseq = atoi(b + 2);
+    }
+    if (*d < 1 || *irseq < 1) return -1;
+    return 0;
+}
+
+char *kvlangKeytreePcAt(const char *vtid, int d, int irseq) {
+    char *fr = kvlangKeytreeFrameAt(vtid, d);
+    char *pc = kvlangKeytreeIrseqPc(fr, irseq);
+    free(fr);
+    return pc;
+}

@@ -44,6 +44,8 @@ extern int   kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *
 extern int   kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap);
 extern int   kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap)
     __attribute__((weak));
+extern int   kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap)
+    __attribute__((weak));
 extern int   kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap);
 extern int   kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
 extern int   kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap);
@@ -163,6 +165,7 @@ int kvlangKvSet(kvlangKv_t *k, const kvlangKvPair_t *pairs, int n, char *err, ui
 int kvlangKvDel(kvlangKv_t *k, const char *key, char *err, uint32_t err_cap);
 int kvlangKvDelTree(kvlangKv_t *k, const char *prefix, char *err, uint32_t err_cap);
 int kvlangKvCp(kvlangKv_t *k, const char *src, const char *dst, char *err, uint32_t err_cap);
+int kvlangKvCpTree(kvlangKv_t *k, const char *src, const char *dst, char *err, uint32_t err_cap);
 void kvlangKvInvalidateFrame(kvlangKv_t *k, const char *frame_root);
 int kvlangKvMkindex(kvlangKv_t *k, const char *path, char *err, uint32_t err_cap);
 int kvlangKvExtIndex(kvlangKv_t *k, const char *path, const char *ext, char *err, uint32_t err_cap);
@@ -205,6 +208,8 @@ void kvlangKeytreeFrameCallpc(const char *root, kvlangStrbuf_t *out);
 void kvlangKeytreeFrameReturnpc(const char *root, kvlangStrbuf_t *out);
 void kvlangKeytreeFrameRo(const char *root, kvlangStrbuf_t *out);
 bool kvlangKeytreeIsEntryPc(const char *pc);
+int kvlangKeytreeParsePc(const char *pc, int *d, int *irseq);
+char *kvlangKeytreePcAt(const char *vtid, int d, int irseq);
 
 /* ── rwir ──────────────────────────────────────────────────────────── */
 
@@ -213,6 +218,16 @@ bool kvlangKeytreeIsEntryPc(const char *pc);
 #define OP_BR     "br"
 #define OP_GOTO   "goto"
 #define OP_ASSIGN "assign"
+
+#define OPID_NONE    0
+#define OPID_GOTO    1
+#define OPID_BR      2
+#define OPID_CALL    3
+#define OPID_RETURN  4
+#define OPID_COPY    5
+#define OPID_OTHER   6
+#define OPID_USER    7
+#define OPID_NATIVE  16
 
 static inline bool op_is_control(const char *op) {
     return strcmp(op, OP_CALL) == 0 || strcmp(op, OP_RETURN) == 0 ||
@@ -223,6 +238,7 @@ typedef struct { char *name; kvlangXvalue_t val; } kvlangParam_t;
 
 typedef struct {
     char *opcode;
+    int op_id;
     kvlangParam_t *reads; int nr;
     kvlangParam_t *writes; int nw;
 } kvlangRwirInst_t;
@@ -230,6 +246,7 @@ typedef struct {
 int kvlangRwirNextPc(const char *pc, kvlangStrbuf_t *out);
 int kvlangRwirExtractAddr0(const char *coord);
 int kvlangRwirDecode(kvlangKv_t *kv, const char *link_base, const char *pc, kvlangRwirInst_t *out, char *err, uint32_t err_cap);
+int kvlangRwirDecodeAt(kvlangKv_t *kv, const char *link_base, int irseq, kvlangRwirInst_t *out, char *err, uint32_t err_cap);
 void kvlangRwirInstFree(kvlangRwirInst_t *inst);
 /* 外部扩展 handoff：写共享队列 /lib/<opcode>/vids/<vid>=pc，阻塞 watch 该 key 直至变 None
  * （外部执行器认领、驱动、置 nextpc 后删除该条目 → 本端解除阻塞）。 */
@@ -243,6 +260,9 @@ void kvlangVthreadGet(kvlangKv_t *kv, const char *vtid, char **pc, char **status
 void kvlangVthreadSet(kvlangKv_t *kv, const char *vtid, const char *pc, const char *status);
 void kvlangVthreadSetDone(kvlangKv_t *kv, const char *vtid, const char *ret);
 void kvlangVthreadSetError(kvlangKv_t *kv, const char *vtid, const char *pc, const char *msg);
+int kvlangVthreadReadPacked(kvlangKv_t *kv, const char *vtid, int *d, int *irseq, char **status);
+int kvlangVthreadWritePc(kvlangKv_t *kv, const char *vtid, int d, int irseq);
+void kvlangResolveCacheReset(const char *frame_root);
 
 /* ── builtin ───────────────────────────────────────────────────────── */
 
@@ -252,6 +272,7 @@ typedef struct { kvlangKv_t *kv; const char *vtid; const char *pc; kvlangRwirIns
 
 bool kvlangBuiltinIsNative(const char *opcode);
 bool kvlangBuiltinNumOp(const char *opcode);
+int kvlangOpcodeIntern(kvlangKv_t *kv, const char *opcode);
 int kvlangBuiltinNative(kvlangFrame_t *f);   /* dispatch + call，0 成功 */
 int kvlangBuiltinExecuteCopy(kvlangKv_t *kv, const char *vtid, const char *pc, kvlangRwirInst_t *inst);
 void kvlangBuiltinResolveReadValue(kvlangKv_t *kv, const char *frame_root, const char *name,

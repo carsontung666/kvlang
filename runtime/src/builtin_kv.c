@@ -199,6 +199,38 @@ int kvlangBuiltinKvExtIndex(kvlangFrame_t *f) {
 
 int kvlangBuiltinKvRmIndexExt(kvlangFrame_t *f) { return kv_path_void(f, "kv.rmindexext", kvlangKvDelExtIndex); }
 
+int kvlangBuiltinKvCp(kvlangFrame_t *f) {
+    kvlangXvalue_t in[2]; int n = kvlangBuiltinReadInputs(f, in, 2);
+    char *src = n >= 1 ? path_arg(f, 0, in) : NULL;
+    char *dst = n >= 2 ? path_arg(f, 1, in) : NULL;
+    if (!src || !dst) {
+        free(src); free(dst); kvlangBuiltinFreeInputs(in, n);
+        return kvlangBuiltinSetErr(f, "TypeError: kv.cp requires src and dst");
+    }
+    char err[256];
+    int rc = kvlangKvCp(f->kv, src, dst, err, sizeof err);
+    free(src); free(dst); kvlangBuiltinFreeInputs(in, n);
+    if (rc != 0) return kvlangBuiltinSetErr(f, "%s", err);
+    kvlangBuiltinNextPc(f);
+    return 0;
+}
+
+int kvlangBuiltinKvCpdir(kvlangFrame_t *f) {
+    kvlangXvalue_t in[2]; int n = kvlangBuiltinReadInputs(f, in, 2);
+    char *src = n >= 1 ? path_arg(f, 0, in) : NULL;
+    char *dst = n >= 2 ? path_arg(f, 1, in) : NULL;
+    if (!src || !dst) {
+        free(src); free(dst); kvlangBuiltinFreeInputs(in, n);
+        return kvlangBuiltinSetErr(f, "TypeError: kv.cpdir requires src and dst");
+    }
+    char err[256];
+    int rc = kvlangKvCpTree(f->kv, src, dst, err, sizeof err);
+    free(src); free(dst); kvlangBuiltinFreeInputs(in, n);
+    if (rc != 0) return kvlangBuiltinSetErr(f, "%s", err);
+    kvlangBuiltinNextPc(f);
+    return 0;
+}
+
 int kvlangBuiltinKvWatch(kvlangFrame_t *f) {
     kvlangXvalue_t in[2]; int n = kvlangBuiltinReadInputs(f, in, 2);
     char *key = n >= 1 ? path_arg(f, 0, in) : NULL;

@@ -7,7 +7,7 @@ static void pack_typed_array(const char *kind, const kvlangXvalue_t *elems, int 
     uint8_t *raw = malloc((size_t)sz * (n > 0 ? n : 1));
     for (int i = 0; i < n; i++) {
         const uint8_t *b; int32_t blen;
-        kvspaceHead_t h; kvspaceDecodeHead(elems[i].data, elems[i].len, &h);
+        kvspaceHead_t h; kvlangXvalueHead(&elems[i], &h);
         b = elems[i].data + h.body_offset; blen = h.body_len;
         int c = blen < sz ? blen : sz;
         memcpy(raw + i * sz, b, (size_t)c);
@@ -155,7 +155,7 @@ int kvlangBuiltinXvAt(kvlangFrame_t *f) {
     kvlangXvalue_t in[MAX_PARAMS]; int n = kvlangBuiltinReadInputs(f, in, MAX_PARAMS);
     const char *k = kvlangXvalueKind(&in[0]);
     int sz = kvlangXvalueElemSize(k);
-    kvspaceHead_t h; kvspaceDecodeHead(in[0].data, in[0].len, &h);
+    kvspaceHead_t h; kvlangXvalueHead(&in[0], &h);
     kvlang_kindexpr_t kx; kvlang_kindexpr_parse(h.kindexpr, &kx);
     if (sz <= 0 || kx.ndim == 0) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "TypeError: xv.at requires a compact array, got %s", k); }
     if (nidx != kx.ndim) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "IndexError: xv.at: %d-dim array needs %d indices, got %d", kx.ndim, kx.ndim, nidx); }
@@ -174,7 +174,7 @@ int kvlangBuiltinXvSet(kvlangFrame_t *f) {
     kvlangXvalue_t in[MAX_PARAMS]; int n = kvlangBuiltinReadInputs(f, in, MAX_PARAMS);
     const char *k = kvlangXvalueKind(&in[0]);
     int sz = kvlangXvalueElemSize(k);
-    kvspaceHead_t h; kvspaceDecodeHead(in[0].data, in[0].len, &h);
+    kvspaceHead_t h; kvlangXvalueHead(&in[0], &h);
     kvlang_kindexpr_t kx; kvlang_kindexpr_parse(h.kindexpr, &kx);
     if (sz <= 0 || kx.ndim == 0) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "TypeError: xv.set requires a compact array, got %s", k); }
     if (nidx != kx.ndim) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "IndexError: xv.set: %d-dim array needs %d indices, got %d", kx.ndim, kx.ndim, nidx); }
@@ -183,7 +183,7 @@ int kvlangBuiltinXvSet(kvlangFrame_t *f) {
     const uint8_t *body = in[0].data + h.body_offset;
     uint8_t *nb = malloc((size_t)h.body_len);
     memcpy(nb, body, (size_t)h.body_len);
-    kvspaceHead_t vh; kvspaceDecodeHead(in[nidx + 1].data, in[nidx + 1].len, &vh);
+    kvspaceHead_t vh; kvlangXvalueHead(&in[nidx + 1], &vh);
     const uint8_t *vb = in[nidx + 1].data + vh.body_offset;
     int c = vh.body_len < sz ? vh.body_len : sz;
     memcpy(nb + flat * sz, vb, (size_t)c);
@@ -200,7 +200,7 @@ int kvlangBuiltinXvReshape(kvlangFrame_t *f) {
     kvlangXvalue_t in[MAX_PARAMS]; int n = kvlangBuiltinReadInputs(f, in, MAX_PARAMS);
     const char *k = kvlangXvalueKind(&in[0]);
     if (kvlangXvalueElemSize(k) <= 0) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "TypeError: xv.reshape requires a compact array, got %s", k); }
-    kvspaceHead_t h; kvspaceDecodeHead(in[0].data, in[0].len, &h);
+    kvspaceHead_t h; kvlangXvalueHead(&in[0], &h);
     kvlang_kindexpr_t kx; kvlang_kindexpr_parse(h.kindexpr, &kx);
     if (kx.ndim < 1) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "TypeError: xv.reshape requires a compact array, got scalar %s", k); }
     if (ndims > X_MAX_NDIM) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "IndexError: xv.reshape: at most %d dims, got %d", X_MAX_NDIM, ndims); }
@@ -226,7 +226,7 @@ int kvlangBuiltinXvReinterpret(kvlangFrame_t *f) {
     kvlangXvalue_t in[2]; int n = kvlangBuiltinReadInputs(f, in, 2);
     char *ke = kvlangXvalueValueString(&in[1]);
     kvlang_kindexpr_t nkx; kvlang_kindexpr_parse((const uint8_t *)ke, &nkx);
-    kvspaceHead_t h; kvspaceDecodeHead(in[0].data, in[0].len, &h);
+    kvspaceHead_t h; kvlangXvalueHead(&in[0], &h);
     const uint8_t *body = in[0].data + h.body_offset;
     /* 动态 "[]kind"（parse 得 ndim0 但带方括号）：按 body 字节数补出一维长度，与落盘数组表示一致。 */
     int32_t ndim = nkx.ndim;

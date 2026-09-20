@@ -26,16 +26,10 @@ int kvlangRuntimeExecutePc(kvlangRuntime_t *rt, const char *pc) {
 }
 
 static char *read_vthread_pc(kvlangKv_t *kv, const char *vid) {
-  kvlangStrbuf_t key;
-  kvlangStrbufInit(&key);
-  kvlangKeytreeVthreadPc(vid, &key);
-  kvlangXvalue_t v;
-  kvlangXvalueZero(&v);
-  kvlangKvGetOne(kv, key.p, &v);
-  char *pc = kvlangXvalueNone(&v) ? strdup("") : kvlangXvalueValueString(&v);
-  kvlangXvalueFree(&v);
-  kvlangStrbufFree(&key);
-  return pc;
+  char *pc = NULL, *st = NULL;
+  kvlangVthreadGet(kv, vid, &pc, &st);
+  free(st);
+  return pc ? pc : strdup("");
 }
 
 int kvlangRuntimeExecuteVthread(kvlangRuntime_t *rt, const char *vid,

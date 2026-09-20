@@ -28,6 +28,7 @@ build/
 *.o
 *.a
 *.lib
+bench/iops/.run/
 
 # ── IDE / Editor ─────────────────────────────────────
 .idea/

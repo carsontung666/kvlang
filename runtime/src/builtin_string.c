@@ -40,27 +40,25 @@ static uint32_t *string_runes(const kvlangXvalue_t *v, int *out_n) {
 
 static void new_char32_cp(kvlangXvalue_t *out, uint32_t cp) {
     uint8_t le[4] = { cp & 0xFF, (cp >> 8) & 0xFF, (cp >> 16) & 0xFF, (cp >> 24) & 0xFF };
-    uint8_t *o; uint32_t l; int32_t d = 1;
-    kvspaceTlvEncode(KVSPACE_KIND_CHAR, le, 4, &d, 1, &o, &l);
-    out->data = o; out->len = l;
+    int32_t d = 1;
+    kvlangXvalueNewTlvDims(out, KVSPACE_KIND_CHAR, le, 4, &d, 1);
 }
 
 static int write_char32(kvlangFrame_t *f, const uint32_t *r, int n) {
     kvlangXvalue_t e;
+    kvlangXvalueZero(&e);
     if (n > 0) {
         kvlangStrbuf_t raw; kvlangStrbufInit(&raw);
         for (int i = 0; i < n; i++) {
             uint8_t le[4] = { r[i] & 0xFF, (r[i] >> 8) & 0xFF, (r[i] >> 16) & 0xFF, (r[i] >> 24) & 0xFF };
             kvlangStrbufPutn(&raw, (const char *)le, 4);
         }
-        uint8_t *out; uint32_t len; int32_t d = n;
-        kvspaceTlvEncode(KVSPACE_KIND_CHAR, (const uint8_t *)raw.p, (uint32_t)raw.len, &d, 1, &out, &len);
+        int32_t d = n;
+        kvlangXvalueNewTlvDims(&e, KVSPACE_KIND_CHAR, (const uint8_t *)raw.p, (uint32_t)raw.len, &d, 1);
         kvlangStrbufFree(&raw);
-        e.data = out; e.len = len;
     } else {
-        uint8_t *out; uint32_t len; int32_t d = 0;
-        kvspaceTlvEncode(KVSPACE_KIND_CHAR, (const uint8_t *)"", 0, &d, 1, &out, &len);
-        e.data = out; e.len = len;
+        int32_t d = 0;
+        kvlangXvalueNewTlvDims(&e, KVSPACE_KIND_CHAR, (const uint8_t *)"", 0, &d, 1);
     }
     int rc = kvlangBuiltinWriteResult(f, &e);
     kvlangXvalueFree(&e);

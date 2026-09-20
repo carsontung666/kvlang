@@ -1,0 +1,17 @@
+// kv·cp：拷贝单 key，之后改 src 不影响 dst
+// 期望输出:
+//   dst: 10
+//   src after: 20
+//   dst after: 10
+
+rwfunc test() -> () {
+	kv·set("/cp_src", 10)
+	kv·cp("/cp_src", "/cp_dst")
+	d1 <- kv·get("/cp_dst")
+	println("dst:", d1)
+	kv·set("/cp_src", 20)
+	s2 <- kv·get("/cp_src")
+	d2 <- kv·get("/cp_dst")
+	println("src after:", s2)
+	println("dst after:", d2)
+}

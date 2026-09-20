@@ -72,6 +72,37 @@ static int cmp_int(const kvlangXvalue_t *a, const kvlangXvalue_t *b) {
 /* ── resolve ───────────────────────────────────────────────────────── */
 /* #116 后 if/while 不再建 scope 帧，当前帧 [d] 即 rwfunc 帧，frame_root 直接可用。 */
 
+#define SLOT_CAP 128
+typedef struct { char name[80]; char key[512]; } slot_ent_t;
+static slot_ent_t g_slots[SLOT_CAP];
+static int g_nslots;
+static char g_slot_fr[256];
+
+void kvlangResolveCacheReset(const char *frame_root) {
+    if (frame_root && g_slot_fr[0] && strcmp(g_slot_fr, frame_root) == 0)
+        return;
+    g_nslots = 0;
+    if (frame_root)
+        snprintf(g_slot_fr, sizeof g_slot_fr, "%s", frame_root);
+    else
+        g_slot_fr[0] = 0;
+}
+
+static const char *slot_find(const char *name) {
+    for (int i = 0; i < g_nslots; i++)
+        if (strcmp(g_slots[i].name, name) == 0)
+            return g_slots[i].key;
+    return NULL;
+}
+
+static void slot_put(const char *name, const char *key) {
+    if (!name || !key || g_nslots >= SLOT_CAP)
+        return;
+    snprintf(g_slots[g_nslots].name, sizeof g_slots[0].name, "%s", name);
+    snprintf(g_slots[g_nslots].key, sizeof g_slots[0].key, "%s", key);
+    g_nslots++;
+}
+
 void kvlangBuiltinResolveReadValue(kvlangKv_t *kv, const char *frame_root, const char *name,
                            const kvlangXvalue_t *val, kvlangXvalue_t *out) {
     kvlangXvalueZero(out);
@@ -83,6 +114,8 @@ void kvlangBuiltinResolveReadValue(kvlangKv_t *kv, const char *frame_root, const
     }
     if (!name || !name[0]) return;
     if (name[0] == '/') { kvlangKvGetOne(kv, name, out); return; }
+    const char *ck = slot_find(name);
+    if (ck) { kvlangKvGetOne(kv, ck, out); return; }
     char *stk = kvlangKeytreeStack(frame_root);
     kvlangXvalue_t pv; kvlangXvalueZero(&pv);
     kvlangKvGetMember(kv, stk, name, &pv);
@@ -99,12 +132,19 @@ void kvlangBuiltinResolveReadValue(kvlangKv_t *kv, const char *frame_root, const
         kvlangXvalueFree(&av);
     } else if (!kvlangXvalueNone(&pv)) {
         *out = pv; pv.data = NULL; pv.len = 0;
+        char member[2048];
+        snprintf(member, sizeof member, "%s%s", stk, name);
+        slot_put(name, member);
+        kvlangXvalueFree(&pv); free(stk);
+        return;
     }
     kvlangXvalueFree(&pv); free(stk);
 }
 
 char *kvlangBuiltinResolveWriteSlot(kvlangKv_t *kv, const char *frame_root, const char *name) {
     if (name[0] == '/') return strdup(name);
+    const char *ck = slot_find(name);
+    if (ck) return strdup(ck);
     char *stk = kvlangKeytreeStack(frame_root);
     kvlangXvalue_t pv; kvlangXvalueZero(&pv);
     kvlangKvGetMember(kv, stk, name, &pv);
@@ -133,10 +173,14 @@ char *kvlangBuiltinResolveWriteSlot(kvlangKv_t *kv, const char *frame_root, cons
         kvlangXvalueFree(&av);
     }
     kvlangXvalueFree(&pv);
-    if (result) { free(stk); return result; }
+    if (result) {
+        free(stk);
+        return result;
+    }
     kvlangStrbuf_t o; kvlangStrbufInit(&o);
     kvlangStrbufPuts(&o, stk); kvlangStrbufPuts(&o, name);
     free(stk);
+    slot_put(name, o.p);
     return kvlangStrbufDetach(&o);
 }
 
@@ -176,7 +220,7 @@ void kvlangBuiltinXvalueAt(const kvlangXvalue_t *v, int i, kvlangXvalue_t *out) 
     const char *k = kvlangXvalueKind(v);
     int sz = kvlangXvalueElemSize(k);
     if (sz <= 0) return;
-    kvspaceHead_t h; kvspaceDecodeHead(v->data, v->len, &h);
+    kvspaceHead_t h; kvlangXvalueHead(v, &h);
     const uint8_t *body = v->data + h.body_offset;
     kvlangXvalueNewTlv(out, k, body + i * sz, (uint32_t)sz, 1);
 }
@@ -219,10 +263,15 @@ int kvlangBuiltinReadInputs(kvlangFrame_t *f, kvlangXvalue_t *out, int cap) {
 void kvlangBuiltinFreeInputs(kvlangXvalue_t *in, int n) { for (int i = 0; i < n; i++) kvlangXvalueFree(&in[i]); }
 
 void kvlangBuiltinNextPc(kvlangFrame_t *f) {
-    kvlangStrbuf_t npc; kvlangStrbufInit(&npc);
-    kvlangRwirNextPc(f->pc, &npc);
-    kvlangVthreadSet(f->kv, f->vtid, npc.p, "running");
-    kvlangStrbufFree(&npc);
+    int d = 1, irseq = 1;
+    if (kvlangKeytreeParsePc(f->pc, &d, &irseq) == 0)
+        kvlangVthreadWritePc(f->kv, f->vtid, d, irseq + 1);
+    else {
+        kvlangStrbuf_t npc; kvlangStrbufInit(&npc);
+        kvlangRwirNextPc(f->pc, &npc);
+        kvlangVthreadSet(f->kv, f->vtid, npc.p, NULL);
+        kvlangStrbufFree(&npc);
+    }
 }
 
 int kvlangBuiltinWriteResult(kvlangFrame_t *f, const kvlangXvalue_t *result) {
@@ -499,6 +548,28 @@ static int kvlangBuiltinCastChar(kvlangFrame_t *f, const char *kind) {
     int rc = kvlangBuiltinWriteResult(f, &r); kvlangXvalueFree(&r); free(s); kvlangBuiltinFreeInputs(in, n);
     return rc;
 }
+static int kvlangBuiltinPrintLine(kvlangFrame_t *f, const char *sep, int nl, FILE *fp) {
+    kvlangXvalue_t in[16];
+    int n = kvlangBuiltinReadInputs(f, in, 16);
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && sep && sep[0])
+            fputs(sep, fp);
+        if (kvlangXvalueNone(&in[i]))
+            continue;
+        char *s = kvlangXvalueValueString(&in[i]);
+        fputs(s ? s : "", fp);
+        free(s);
+    }
+    if (nl)
+        fputc('\n', fp);
+    kvlangBuiltinFreeInputs(in, n);
+    kvlangBuiltinNextPc(f);
+    return 0;
+}
+static int kvlangBuiltinPrint(kvlangFrame_t *f) { return kvlangBuiltinPrintLine(f, "", 0, stdout); }
+static int kvlangBuiltinPrintln(kvlangFrame_t *f) { return kvlangBuiltinPrintLine(f, " ", 1, stdout); }
+static int kvlangBuiltinCerr(kvlangFrame_t *f) { return kvlangBuiltinPrintLine(f, " ", 1, stderr); }
+
 static int kvlangBuiltinCastChar32(kvlangFrame_t *f) { return kvlangBuiltinCastChar(f, KVSPACE_KIND_CHAR); }
 static int kvlangBuiltinCastChar8(kvlangFrame_t *f) { return kvlangBuiltinCastChar(f, KVSPACE_KIND_CHAR_UTF8); }
 static int kvlangBuiltinCastCharAscii(kvlangFrame_t *f) { return kvlangBuiltinCastChar(f, KVSPACE_KIND_CHAR_ASCII); }
@@ -569,12 +640,16 @@ static const struct { const char *op; kvlangBuiltinFn fn; } myrwircaps[] = {
     {"kv·get", kvlangBuiltinKvGet}, {"kv·set", kvlangBuiltinKvSet}, {"kv·del", kvlangBuiltinKvDel},
     {"kv·deltree", kvlangBuiltinKvDelTree}, {"kv·list", kvlangBuiltinKvList}, {"kv·listlen", kvlangBuiltinKvListLen}, {"kv·listn", kvlangBuiltinKvListN}, {"kv·mkindex", kvlangBuiltinKvMkindex},
     {"kv·extindex", kvlangBuiltinKvExtIndex}, {"kv·rmindexext", kvlangBuiltinKvRmIndexExt}, {"kv·watch", kvlangBuiltinKvWatch},
+    {"kv·cp", kvlangBuiltinKvCp}, {"kv·cpdir", kvlangBuiltinKvCpdir},
     {"vthread·create", kvlangBuiltinVthreadCreate},
     {"vthread·run", kvlangBuiltinVthreadRun},
     {"vthread·call", kvlangBuiltinVthreadCall},
     {"vthread·sleep", kvlangBuiltinVthreadSleep},
     {"vthread·setstatus", kvlangBuiltinVthreadSetstatus},
     {"debugger", kvlangBuiltinDebugger},
+    {"print", kvlangBuiltinPrint},
+    {"println", kvlangBuiltinPrintln},
+    {"cerr", kvlangBuiltinCerr},
 };
 
 static const size_t myrwircaps_n = sizeof(myrwircaps) / sizeof(myrwircaps[0]);
@@ -592,10 +667,23 @@ static const char *strip_num_kind(const char *op) {
     return op;
 }
 
-bool kvlangBuiltinIsNative(const char *opcode) {
+int kvlangOpcodeIntern(kvlangKv_t *kv, const char *opcode) {
+    if (!opcode || !opcode[0]) return OPID_NONE;
+    if (opcode[0] == 'g' && strcmp(opcode, OP_GOTO) == 0) return OPID_GOTO;
+    if (opcode[0] == 'b' && strcmp(opcode, OP_BR) == 0) return OPID_BR;
+    if (opcode[0] == 'c' && strcmp(opcode, OP_CALL) == 0) return OPID_CALL;
+    if (opcode[0] == 'r' && strcmp(opcode, OP_RETURN) == 0) return OPID_RETURN;
+    if (opcode[0] == '=' && opcode[1] == 0) return OPID_COPY;
     const char *op = strip_num_kind(opcode);
-    for (size_t i = 0; i < myrwircaps_n; i++) if (strcmp(myrwircaps[i].op, op) == 0) return true;
-    return false;
+    for (size_t i = 0; i < myrwircaps_n; i++)
+        if (strcmp(myrwircaps[i].op, op) == 0)
+            return OPID_NATIVE + (int)i;
+    if (kv && isothersrwir(kv, opcode)) return OPID_OTHER;
+    return OPID_USER;
+}
+
+bool kvlangBuiltinIsNative(const char *opcode) {
+    return kvlangOpcodeIntern(NULL, opcode) >= OPID_NATIVE;
 }
 
 bool kvlangBuiltinNumOp(const char *opcode) {
@@ -615,6 +703,11 @@ bool kvlangBuiltinNumOp(const char *opcode) {
 }
 
 int kvlangBuiltinNative(kvlangFrame_t *f) {
+    int id = f->inst->op_id;
+    if (id >= OPID_NATIVE) {
+        unsigned i = (unsigned)(id - OPID_NATIVE);
+        if (i < myrwircaps_n) return myrwircaps[i].fn(f);
+    }
     const char *op = strip_num_kind(f->inst->opcode);
     for (size_t i = 0; i < myrwircaps_n; i++) {
         if (strcmp(myrwircaps[i].op, op) == 0) return myrwircaps[i].fn(f);

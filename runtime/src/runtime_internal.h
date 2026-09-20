@@ -64,6 +64,7 @@ extern int   kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len);
 #define MAX_PARAMS 128
 #define MAX_STACK_DEPTH 256
 #define X_MAX_NDIM 8
+#define KVLANG_XVALUE_HEADLEN 64
 
 /* ── 派生 head：解析 kindexpr 得到（不落盘） ───────────────────────── */
 
@@ -146,6 +147,8 @@ void kvlangXvalueNewRwir(kvlangXvalue_t *v, int32_t nr, int32_t nw, const char *
 void kvlangXvalueNewTlv(kvlangXvalue_t *v, const char *kind, const uint8_t *raw, uint32_t raw_len, int32_t al);
 void kvlangXvalueNewTlvDims(kvlangXvalue_t *v, const char *kind, const uint8_t *raw, uint32_t raw_len,
                             const int32_t *dims, int32_t ndim);
+int kvlangXvalueEncodeBox(const char *kind, const uint8_t *raw, uint32_t raw_len,
+                          const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len);
 
 void kvlangFormatFloat(char *out, size_t cap, double v);
 

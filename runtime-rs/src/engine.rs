@@ -65,12 +65,50 @@ impl Engine {
                 return String::new();
             }
             let mut head = KvspaceHead::default();
-            kvspaceDecodeHead(out, olen, &mut head);
-            let kx = String::from_utf8_lossy(&head.kindexpr)
-                .trim_end_matches('\0')
-                .to_string();
-            let (_, _, kind) = parse_kindexpr(&kx);
-            let (bo, bl) = (head.body_offset as usize, head.body_len.max(0) as usize);
+            let (bo, bl, kind_owned);
+            let kind: &str;
+            if olen >= 64 && *out.add(1) <= 4 && *out.add(3) <= 8 {
+                let bodylen = u64::from_le_bytes([
+                    *out.add(8), *out.add(9), *out.add(10), *out.add(11),
+                    *out.add(12), *out.add(13), *out.add(14), *out.add(15),
+                ]);
+                let cap = u64::from_le_bytes([
+                    *out.add(16), *out.add(17), *out.add(18), *out.add(19),
+                    *out.add(20), *out.add(21), *out.add(22), *out.add(23),
+                ]);
+                if bodylen <= cap && 64 + bodylen <= olen as u64 {
+                    let kid = u16::from_le_bytes([*out.add(24), *out.add(25)]);
+                    kind_owned = match kid {
+                        5 => "int64",
+                        12 => "char/utf32",
+                        13 => "char/utf8",
+                        14 => "char/ascii",
+                        _ => "",
+                    }
+                    .to_string();
+                    kind = &kind_owned;
+                    bo = 64;
+                    bl = bodylen as usize;
+                } else {
+                    kvspaceDecodeHead(out, olen, &mut head);
+                    let kx = String::from_utf8_lossy(&head.kindexpr)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    kind_owned = parse_kindexpr(&kx).2;
+                    kind = &kind_owned;
+                    bo = head.body_offset as usize;
+                    bl = head.body_len.max(0) as usize;
+                }
+            } else {
+                kvspaceDecodeHead(out, olen, &mut head);
+                let kx = String::from_utf8_lossy(&head.kindexpr)
+                    .trim_end_matches('\0')
+                    .to_string();
+                kind_owned = parse_kindexpr(&kx).2;
+                kind = &kind_owned;
+                bo = head.body_offset as usize;
+                bl = head.body_len.max(0) as usize;
+            }
             let s = if kind == "char/utf32" {
                 std::slice::from_raw_parts(out.add(bo), bl)
                     .chunks_exact(4)
@@ -193,6 +231,19 @@ impl Engine {
         let tlv = self.get_tlv(&p);
         if tlv.is_empty() {
             return Vec::new();
+        }
+        if tlv.len() >= 64 && tlv[1] <= 4 && tlv[3] <= 8 {
+            let bodylen = u64::from_le_bytes(tlv[8..16].try_into().unwrap());
+            let cap = u64::from_le_bytes(tlv[16..24].try_into().unwrap());
+            if bodylen <= cap && 64 + bodylen <= tlv.len() as u64 {
+                let bo = 64usize;
+                let bl = bodylen as usize;
+                if tlv[0] == 2 {
+                    let body = String::from_utf8_lossy(&tlv[bo..bo + bl]).into_owned();
+                    return self.resolve_ext_bytes(&body);
+                }
+                return tlv[bo..bo + bl].to_vec();
+            }
         }
         unsafe {
             let mut h = KvspaceHead::default();

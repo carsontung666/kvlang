@@ -1,11 +1,147 @@
 #include "runtime_internal.h"
 
-/* 后端无关的 XValue TLV 编解码（对齐 kvspace-durable/kvspace-c 的 kindexp TLV）。
- * shm 借用读：data 指向 kvspace 映射（borrowed=1，勿 free）；其它路径 malloc。 */
+/* 64-byte head, body at +64. Legacy TLV still decodes. Borrowed shm Get: do not free. */
 
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32); }
+static void wr16(uint8_t *d, uint16_t v) { d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); }
+static void wr32(uint8_t *d, uint32_t v) {
+    d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); d[2] = (uint8_t)(v >> 16); d[3] = (uint8_t)(v >> 24);
+}
+static void wr64(uint8_t *d, uint64_t v) { wr32(d, (uint32_t)v); wr32(d + 4, (uint32_t)(v >> 32)); }
+
+#define H64_STORETYPE 1
+#define H64_NDIM      3
+#define H64_VID       4
+#define H64_BODYLEN   8
+#define H64_BODYCAP   16
+#define H64_KIND      24
+#define H64_DIMS      28
+#define H64_ST_NONE   0
+#define H64_ST_ATOM   1
+#define H64_ST_ARRAY  2
+#define H64_ST_INDEX  3
+#define H64_ST_EXT    4
+
+static const char *const h64_kind_names[] = {
+    "", KVSPACE_KIND_BOOL,
+    KVSPACE_KIND_INT8, KVSPACE_KIND_INT16, KVSPACE_KIND_INT32, KVSPACE_KIND_INT64,
+    KVSPACE_KIND_UINT8, KVSPACE_KIND_UINT16, KVSPACE_KIND_UINT32, KVSPACE_KIND_UINT64,
+    KVSPACE_KIND_FLOAT32, KVSPACE_KIND_FLOAT64,
+    KVSPACE_KIND_CHAR, KVSPACE_KIND_CHAR_UTF8, KVSPACE_KIND_CHAR_ASCII,
+    KVSPACE_KIND_OBJ, KVSPACE_KIND_MAP, KVSPACE_KIND_INDEX, KVSPACE_KIND_EXT_INDEX,
+    KVSPACE_KIND_RWIR, KVSPACE_KIND_RWFUNC, KVSPACE_KIND_DEF_RWIR, KVSPACE_KIND_SCOPE,
+    KVSPACE_KIND_TIME, KVSPACE_KIND_DURATION, KVSPACE_KIND_DEF_RWFUNC,
+};
+
+static const char *h64_kind_name(uint16_t id) {
+    if (id < sizeof(h64_kind_names) / sizeof(h64_kind_names[0]))
+        return h64_kind_names[id];
+    return "*";
+}
+
+static uint16_t h64_kind_id(const char *name) {
+    if (!name || !name[0] || strcmp(name, KVSPACE_KIND_NONE) == 0)
+        return 0;
+    for (uint16_t i = 1; i < sizeof(h64_kind_names) / sizeof(h64_kind_names[0]); i++)
+        if (strcmp(name, h64_kind_names[i]) == 0)
+            return i;
+    return 255;
+}
+
+static uint8_t h64_storetype(const char *kind, int32_t ndim) {
+    if (!kind || !kind[0] || strcmp(kind, KVSPACE_KIND_NONE) == 0)
+        return H64_ST_NONE;
+    if (strcmp(kind, KVSPACE_KIND_EXT_INDEX) == 0)
+        return H64_ST_EXT;
+    if (strcmp(kind, KVSPACE_KIND_INDEX) == 0 || strcmp(kind, KVSPACE_KIND_RWFUNC) == 0 ||
+        strcmp(kind, KVSPACE_KIND_DEF_RWIR) == 0 || strcmp(kind, KVSPACE_KIND_DEF_RWFUNC) == 0 ||
+        kind[0] == '/')
+        return H64_ST_INDEX;
+    if (ndim > 0)
+        return H64_ST_ARRAY;
+    return H64_ST_ATOM;
+}
+
+static int looks_head64(const uint8_t *d, uint32_t len) {
+    if (!d || len < KVLANG_XVALUE_HEADLEN)
+        return 0;
+    if (d[H64_STORETYPE] > H64_ST_EXT || d[H64_NDIM] > X_MAX_NDIM)
+        return 0;
+    uint64_t bl = rd64(d + H64_BODYLEN), cap = rd64(d + H64_BODYCAP);
+    if (bl > cap || bl > 16ull * 1024ull * 1024ull)
+        return 0;
+    if ((uint64_t)KVLANG_XVALUE_HEADLEN + bl > len)
+        return 0;
+    return 1;
+}
+
+static int decode_head64(const uint8_t *d, uint32_t len, kvspaceHead_t *h) {
+    memset(h, 0, sizeof(*h));
+    if (!looks_head64(d, len))
+        return -1;
+    int8_t ref = (int8_t)d[0];
+    uint8_t st = d[H64_STORETYPE];
+    uint8_t ndim = d[H64_NDIM];
+    uint16_t kid = rd16(d + H64_KIND);
+    const char *kn = h64_kind_name(kid);
+    int o = 0;
+    if (ref == 1)
+        h->kindexpr[o++] = '*';
+    else if (ref == 2 || ref == -1)
+        h->kindexpr[o++] = '@';
+    if (st == H64_ST_ARRAY && ndim > 0) {
+        h->kindexpr[o++] = '[';
+        for (int i = 0; i < ndim && o < 200; i++) {
+            if (i)
+                h->kindexpr[o++] = ',';
+            o += snprintf((char *)h->kindexpr + o, sizeof h->kindexpr - (size_t)o, "%u",
+                          rd32(d + H64_DIMS + i * 4));
+        }
+        h->kindexpr[o++] = ']';
+    }
+    size_t kl = strlen(kn);
+    if (o + (int)kl >= (int)sizeof h->kindexpr)
+        kl = sizeof h->kindexpr - (size_t)o - 1;
+    memcpy(h->kindexpr + o, kn, kl);
+    h->kindexpr[o + (int)kl] = 0;
+    h->ro = d[2] & 1;
+    h->vid = rd32(d + H64_VID);
+    h->body_len = (int32_t)rd64(d + H64_BODYLEN);
+    h->body_offset = KVLANG_XVALUE_HEADLEN;
+    return h->kindexpr[0] ? 0 : (kid == 0 ? 0 : -1);
+}
+
+int kvlangXvalueEncodeBox(const char *kind, const uint8_t *raw, uint32_t raw_len,
+                          const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
+    if (!out || !out_len)
+        return -1;
+    if (ndim < 0)
+        ndim = 0;
+    if (ndim > X_MAX_NDIM)
+        return -1;
+    if (!kind)
+        kind = "";
+    uint32_t total = (uint32_t)KVLANG_XVALUE_HEADLEN + raw_len;
+    uint8_t *buf = malloc(total ? total : 1);
+    if (!buf)
+        return -1;
+    memset(buf, 0, KVLANG_XVALUE_HEADLEN);
+    buf[0] = 0;
+    buf[H64_STORETYPE] = h64_storetype(kind, ndim);
+    buf[H64_NDIM] = (uint8_t)ndim;
+    wr64(buf + H64_BODYLEN, raw_len);
+    wr64(buf + H64_BODYCAP, raw_len);
+    wr16(buf + H64_KIND, h64_kind_id(kind));
+    for (int i = 0; i < ndim; i++)
+        wr32(buf + H64_DIMS + i * 4, (uint32_t)(dims ? dims[i] : 0));
+    if (raw_len && raw)
+        memcpy(buf + KVLANG_XVALUE_HEADLEN, raw, raw_len);
+    *out = buf;
+    *out_len = total;
+    return 0;
+}
 
 void kvlangXvalueFree(kvlangXvalue_t *v) {
     if (v->data && !v->borrowed)
@@ -21,7 +157,6 @@ void kvlangXvalueSetBytes(kvlangXvalue_t *v, uint8_t *data, uint32_t len) {
     v->borrowed = 0;
 }
 
-/* 解析 kindexpr 内容 → (ref, dims, base kind)。kindexpr 为 NUL 终止串。 */
 void kvlang_kindexpr_parse(const uint8_t *kx, kvlang_kindexpr_t *out) {
     memset(out, 0, sizeof(*out));
     if (!kx) return;
@@ -44,23 +179,21 @@ void kvlang_kindexpr_parse(const uint8_t *kx, kvlang_kindexpr_t *out) {
     for (int d = 0; d < out->ndim; d++) out->array_len *= out->dims[d];
 }
 
-/* head 编解码统一委托给链接的 kvspace .so（kvspace-c / kvspace-durable 同一 ABI），
- * runtime 不再私持 TLV head 布局，杜绝多份手写偏移不一致。 */
 static int kvlangXvalueDecodeHeadRaw(const uint8_t *d, uint32_t len, kvspaceHead_t *h) {
     memset(h, 0, sizeof(*h));
     if (!d || len == 0) return -1;
+    if (looks_head64(d, len))
+        return decode_head64(d, len, h);
     kvspaceDecodeHead(d, len, h);
     return h->kindexpr[0] ? 0 : -1;
 }
 
-/* array_len → dims：char/* 恒一维（含空串/单字符）；其余标量(≤1)=0 维、多元素=1 维。 */
 static int32_t al_to_dims(const char *kind, int32_t array_len, int32_t *dims) {
     if (strncmp(kind, "char/", 5) == 0) { dims[0] = array_len < 0 ? 0 : array_len; return 1; }
     if (array_len > 1) { dims[0] = array_len; return 1; }
     return 0;
 }
 
-/* .so 分配的 TLV → 转交 runtime 所有权（统一 free 释放）。 */
 static uint8_t *kvlangXvalueOwn(uint8_t *tmp, uint32_t tl, uint32_t *out_len) {
     if (!tmp) { *out_len = 0; return NULL; }
     uint8_t *buf = malloc(tl);
@@ -73,9 +206,10 @@ static uint8_t *kvlangXvalueOwn(uint8_t *tmp, uint32_t tl, uint32_t *out_len) {
 static uint8_t *kvlangXvalueEncodeTlv(const char *kind, const uint8_t *raw,
                               uint32_t raw_len, int32_t array_len, uint32_t *out_len) {
     int32_t dims[1]; int32_t ndim = al_to_dims(kind, array_len, dims);
-    uint8_t *tmp = NULL; uint32_t tl = 0;
-    if (kvspaceTlvEncode(kind, raw, raw_len, dims, ndim, &tmp, &tl) != 0) { *out_len = 0; return NULL; }
-    return kvlangXvalueOwn(tmp, tl, out_len);
+    uint8_t *buf = NULL;
+    if (kvlangXvalueEncodeBox(kind, raw, raw_len, dims, ndim, &buf, out_len) != 0)
+        return NULL;
+    return buf;
 }
 
 int kvlangXvalueHead(const kvlangXvalue_t *v, kvspaceHead_t *h) {
@@ -90,6 +224,14 @@ const char *kvlangXvalueKind(const kvlangXvalue_t *v) {
     char *b = buf[idx];
     idx = (idx + 1) & 15;
     if (kvlangXvalueNone(v)) { b[0] = 0; return b; }
+    if (looks_head64(v->data, v->len)) {
+        const char *kn = h64_kind_name(rd16(v->data + H64_KIND));
+        size_t kl = strlen(kn);
+        if (kl > 32) kl = 32;
+        memcpy(b, kn, kl);
+        b[kl] = 0;
+        return b;
+    }
     kvspaceHead_t h;
     if (kvlangXvalueHead(v, &h) < 0) { b[0] = 0; return b; }
     kvlang_kindexpr_t kx; kvlang_kindexpr_parse(h.kindexpr, &kx);
@@ -163,12 +305,29 @@ int32_t kvlangXvalueElemSize(const char *kind) {
 }
 
 static const uint8_t *v_body(const kvlangXvalue_t *v, kvspaceHead_t *h) {
+    if (looks_head64(v->data, v->len)) {
+        if (h && decode_head64(v->data, v->len, h) < 0) return NULL;
+        return v->data + KVLANG_XVALUE_HEADLEN;
+    }
     if (kvlangXvalueDecodeHeadRaw(v->data, v->len, h) < 0) return NULL;
     return v->data + h->body_offset;
 }
 
 int64_t kvlangXvalueAsInt64(const kvlangXvalue_t *v) {
     if (kvlangXvalueNone(v)) return 0;
+    if (looks_head64(v->data, v->len) && v->len >= (uint32_t)KVLANG_XVALUE_HEADLEN + 8) {
+        uint16_t id = rd16(v->data + H64_KIND);
+        const uint8_t *b = v->data + KVLANG_XVALUE_HEADLEN;
+        if (id == 5) return (int64_t)rd64(b); /* int64 */
+        if (id == 4) return (int32_t)rd32(b);
+        if (id == 3) return (int16_t)rd16(b);
+        if (id == 2) return (int8_t)b[0];
+        if (id == 9) return (int64_t)rd64(b);
+        if (id == 8) return (int64_t)rd32(b);
+        if (id == 7) return rd16(b);
+        if (id == 6) return b[0];
+        if (id == 1) return b[0] != 0;
+    }
     kvspaceHead_t h; const uint8_t *b = v_body(v, &h);
     if (!b) return 0;
     const char *k = kvlangXvalueKind(v);
@@ -269,8 +428,6 @@ char *kvlangXvaluePtrTarget(const kvlangXvalue_t *v) {
     return strndup2(b, h.body_len);
 }
 
-/* ── value_string（对齐 Go ValueString）────────────────────────────── */
-
 static void append_num_int(kvlangStrbuf_t *b, int64_t n) { kvlangStrbufPrintf(b, "%lld", (long long)n); }
 static void append_num_uint(kvlangStrbuf_t *b, uint64_t n) { kvlangStrbufPrintf(b, "%llu", (unsigned long long)n); }
 
@@ -326,24 +483,21 @@ char *kvlangXvalueValueString(const kvlangXvalue_t *v) {
     return strndup2(body, blen);
 }
 
-/* ── 构造 ──────────────────────────────────────────────────────────── */
-
 void kvlangXvalueNewTlv(kvlangXvalue_t *v, const char *kind, const uint8_t *raw, uint32_t raw_len, int32_t al) {
     uint32_t len;
+    v->borrowed = 0;
     v->data = kvlangXvalueEncodeTlv(kind, raw, raw_len, al, &len);
     v->len = len;
 }
 
-/* 显式 ndim/dims 构造（保留多维 shape，供 xv.shape/xv.set 用）。 */
 void kvlangXvalueNewTlvDims(kvlangXvalue_t *v, const char *kind, const uint8_t *raw, uint32_t raw_len,
                             const int32_t *dims, int32_t ndim) {
-    uint8_t *tmp = NULL; uint32_t tl = 0;
-    if (kvspaceTlvEncode(kind, raw, raw_len, dims, ndim, &tmp, &tl) != 0 || !tmp) {
+    uint8_t *buf = NULL;
+    uint32_t tl = 0;
+    v->borrowed = 0;
+    if (kvlangXvalueEncodeBox(kind, raw, raw_len, dims, ndim, &buf, &tl) != 0 || !buf) {
         v->data = NULL; v->len = 0; return;
     }
-    uint8_t *buf = malloc(tl);
-    memcpy(buf, tmp, tl);
-    kvspaceBytesFree(tmp, tl);
     v->data = buf; v->len = tl;
 }
 
@@ -383,7 +537,6 @@ void kvlangXvalueNewCharUtf32(kvlangXvalue_t *v, const char *s) {
     kvlangXvalueNewTlv(v, KVSPACE_KIND_CHAR, (const uint8_t *)raw.p, (uint32_t)raw.len, (int32_t)(raw.len / 4));
     kvlangStrbufFree(&raw);
 }
-/* 指针：head kindexpr = "*" + target_kindexpr（目标完整 kindexpr），body = 目标 key。 */
 void kvlangXvalueNewPtr(kvlangXvalue_t *v, const char *target_kindexpr, const char *target) {
     uint8_t *tmp = NULL; uint32_t tl = 0, len = 0;
     if (kvspaceNewPtr(target_kindexpr, target, &tmp, &tl) != 0) { v->data = NULL; v->len = 0; return; }

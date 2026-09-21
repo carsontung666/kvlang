@@ -29,7 +29,7 @@ builtin_call = ( "abs" | "neg" | "sign" | "pow" | "sqrt" | "exp" | "log"
 (* 类型构造器兼转换：int8(x)/float32(x)/char/utf8(x)/bool(x) …；窄化按补码回绕，float→int 向零截断 *)
 (* 数值运算保宽（fix-034）：同宽→同宽（溢出回绕）、混宽→提升再窄化回结果 kind *)
 (* print 系（ext）：print 无空格拼接不换行；println 空格分隔加换行 *)
-(* debugger(): 内联暂停，非调试模式 no-op *)
+(* debugger(): 内联暂停，恒 ≡ vthread·setstatus("paused")；无调试/非调试模式之分 *)
 (* ÷ : 两侧 int → 整除(C 风格)；任一侧 float → 浮除 *)
 (* s[i] 读返单字符字符串，越界返 ""；s[i]="X" 单字符替换写回新串 *)
 (* + 作用在 string∧string → 拼接 *)

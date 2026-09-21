@@ -123,6 +123,7 @@ extern int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len);
 /* ── 数值上限 ──────────────────────────────────────────────────────── */
 
 #define MAX_PARAMS 128
+#define KVLANG_XVALUE_HEADLEN 64
 #define MAX_STACK_DEPTH 256
 #define X_MAX_NDIM 8
 
@@ -354,6 +355,9 @@ void kvlangXvalueNewTlv(kvlangXvalue_t *v, const char *kind, const uint8_t *raw,
 void kvlangXvalueNewTlvDims(kvlangXvalue_t *v, const char *kind,
                             const uint8_t *raw, uint32_t raw_len,
                             const int32_t *dims, int32_t ndim);
+int kvlangXvalueEncodeBox(const char *kind, const uint8_t *raw, uint32_t raw_len,
+                          const int32_t *dims, int32_t ndim, uint8_t **out,
+                          uint32_t *out_len);
 
 void kvlangFormatFloat(char *out, size_t cap, double v);
 

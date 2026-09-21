@@ -115,11 +115,38 @@ impl Engine {
                 return String::new();
             }
             let mut head = KvspaceHead::default();
-            kvspaceDecodeHead(out, olen, &mut head);
-            let kx = String::from_utf8_lossy(&head.langtype)
-                .trim_end_matches('\0')
-                .to_string();
-            let (bo, bl) = (head.body_offset as usize, head.body_len.max(0) as usize);
+            let (bo, bl, kx);
+            if olen >= 64 && *out.add(1) <= 4 && *out.add(3) <= 8 {
+                let bodylen = u64::from_le_bytes(std::slice::from_raw_parts(out.add(8), 8).try_into().unwrap());
+                let cap = u64::from_le_bytes(std::slice::from_raw_parts(out.add(16), 8).try_into().unwrap());
+                if bodylen <= cap && 64 + bodylen <= olen as u64 {
+                    let kid = u16::from_le_bytes([*out.add(24), *out.add(25)]);
+                    kx = match kid {
+                        5 => "int64",
+                        12 => "char/utf32",
+                        13 => "char/utf8",
+                        14 => "char/ascii",
+                        _ => "",
+                    }
+                    .to_string();
+                    bo = 64;
+                    bl = bodylen as usize;
+                } else {
+                    kvspaceDecodeHead(out, olen, &mut head);
+                    kx = String::from_utf8_lossy(&head.langtype)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    bo = head.body_offset as usize;
+                    bl = head.body_len.max(0) as usize;
+                }
+            } else {
+                kvspaceDecodeHead(out, olen, &mut head);
+                kx = String::from_utf8_lossy(&head.langtype)
+                    .trim_end_matches('\0')
+                    .to_string();
+                bo = head.body_offset as usize;
+                bl = head.body_len.max(0) as usize;
+            }
             if kx.ends_with("char/utf32") {
                 std::slice::from_raw_parts(out.add(bo), bl)
                     .chunks_exact(4)
@@ -225,15 +252,40 @@ impl Engine {
         }
         unsafe {
             let mut h = KvspaceHead::default();
-            if kvspaceDecodeHead(tlv.as_ptr(), tlv.len() as u32, &mut h) != 0 {
+            let (r, bo, bl);
+            if tlv.len() >= 64 && tlv[1] <= 4 && tlv[3] <= 8 {
+                let bodylen = u64::from_le_bytes(tlv[8..16].try_into().unwrap());
+                let cap = u64::from_le_bytes(tlv[16..24].try_into().unwrap());
+                if bodylen <= cap && 64 + bodylen <= tlv.len() as u64 {
+                    r = match tlv[0] {
+                        2 => 2,
+                        1 => 1,
+                        _ => 0,
+                    };
+                    bo = 64;
+                    bl = bodylen as usize;
+                } else if kvspaceDecodeHead(tlv.as_ptr(), tlv.len() as u32, &mut h) != 0 {
+                    return Vec::new();
+                } else {
+                    r = match h.r#ref {
+                        2 => 2,
+                        1 => 1,
+                        _ => 0,
+                    };
+                    bo = h.body_offset as usize;
+                    bl = h.body_len.max(0) as usize;
+                }
+            } else if kvspaceDecodeHead(tlv.as_ptr(), tlv.len() as u32, &mut h) != 0 {
                 return Vec::new();
+            } else {
+                r = match h.r#ref {
+                    2 => 2,
+                    1 => 1,
+                    _ => 0,
+                };
+                bo = h.body_offset as usize;
+                bl = h.body_len.max(0) as usize;
             }
-            let r = match h.r#ref {
-                2 => 2,
-                1 => 1,
-                _ => 0,
-            };
-            let (bo, bl) = (h.body_offset as usize, h.body_len.max(0) as usize);
             if bo + bl > tlv.len() {
                 return Vec::new();
             }

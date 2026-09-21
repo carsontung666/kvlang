@@ -14,6 +14,150 @@ static uint64_t rd64(const uint8_t *p) {
     return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
 }
 
+static void wr16(uint8_t *d, uint16_t v) { d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); }
+static void wr32(uint8_t *d, uint32_t v) {
+    d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); d[2] = (uint8_t)(v >> 16); d[3] = (uint8_t)(v >> 24);
+}
+static void wr64(uint8_t *d, uint64_t v) { wr32(d, (uint32_t)v); wr32(d + 4, (uint32_t)(v >> 32)); }
+
+#define H64_STORETYPE 1
+#define H64_NDIM      3
+#define H64_VID       4
+#define H64_BODYLEN   8
+#define H64_BODYCAP   16
+#define H64_KIND      24
+#define H64_DIMS      28
+#define H64_ST_NONE   0
+#define H64_ST_ATOM   1
+#define H64_ST_ARRAY  2
+#define H64_ST_INDEX  3
+#define H64_ST_EXT    4
+
+static const char *const h64_kind_names[] = {
+    "", KVSPACE_KIND_BOOL,
+    KVSPACE_KIND_INT8, KVSPACE_KIND_INT16, KVSPACE_KIND_INT32, KVSPACE_KIND_INT64,
+    KVSPACE_KIND_UINT8, KVSPACE_KIND_UINT16, KVSPACE_KIND_UINT32, KVSPACE_KIND_UINT64,
+    KVSPACE_KIND_FLOAT32, KVSPACE_KIND_FLOAT64, KVSPACE_KIND_FLOAT16,
+    KVSPACE_KIND_BFLOAT16, KVSPACE_KIND_FLOAT8_E4M3, KVSPACE_KIND_FLOAT8_E5M2,
+    KVSPACE_KIND_CHAR, KVSPACE_KIND_CHAR_UTF8, KVSPACE_KIND_CHAR_ASCII,
+    KVSPACE_KIND_MAP, KVSPACE_KIND_INDEX, KVSPACE_KIND_EXT_INDEX,
+    KVSPACE_KIND_RWIR, KVSPACE_KIND_RWFUNC, KVSPACE_KIND_DEF_RWIR,
+    KVSPACE_KIND_DEF_LANGTYPE, KVSPACE_KIND_SCOPE, KVSPACE_KIND_STRUCT,
+    KVSPACE_KIND_TIME, KVSPACE_KIND_DURATION,
+};
+
+static const char *h64_kind_name(uint16_t id) {
+    if (id < sizeof(h64_kind_names) / sizeof(h64_kind_names[0]))
+        return h64_kind_names[id];
+    return "*";
+}
+
+static uint16_t h64_kind_id(const char *name) {
+    if (!name || !name[0] || strcmp(name, KVSPACE_KIND_NONE) == 0)
+        return 0;
+    for (uint16_t i = 1; i < sizeof(h64_kind_names) / sizeof(h64_kind_names[0]); i++)
+        if (strcmp(name, h64_kind_names[i]) == 0)
+            return i;
+    return 255;
+}
+
+static uint8_t h64_storetype(const char *kind, int32_t ndim) {
+    if (!kind || !kind[0] || strcmp(kind, KVSPACE_KIND_NONE) == 0)
+        return H64_ST_NONE;
+    if (strcmp(kind, KVSPACE_KIND_EXT_INDEX) == 0)
+        return H64_ST_EXT;
+    if (strcmp(kind, KVSPACE_KIND_INDEX) == 0 || strcmp(kind, KVSPACE_KIND_RWFUNC) == 0 ||
+        strcmp(kind, KVSPACE_KIND_DEF_RWIR) == 0 || strcmp(kind, KVSPACE_KIND_DEF_LANGTYPE) == 0 ||
+        kind[0] == '/')
+        return H64_ST_INDEX;
+    if (ndim > 0)
+        return H64_ST_ARRAY;
+    return H64_ST_ATOM;
+}
+
+static int looks_head64(const uint8_t *d, uint32_t len) {
+    if (!d || len < KVLANG_XVALUE_HEADLEN)
+        return 0;
+    if (d[H64_STORETYPE] > H64_ST_EXT || d[H64_NDIM] > X_MAX_NDIM)
+        return 0;
+    uint64_t bl = rd64(d + H64_BODYLEN), cap = rd64(d + H64_BODYCAP);
+    if (bl > cap || bl > 16ull * 1024ull * 1024ull)
+        return 0;
+    if ((uint64_t)KVLANG_XVALUE_HEADLEN + bl > len)
+        return 0;
+    return 1;
+}
+
+static int decode_head64(const uint8_t *d, uint32_t len, kvspaceHead_t *h) {
+    memset(h, 0, sizeof(*h));
+    if (!looks_head64(d, len))
+        return -1;
+    int8_t ref = (int8_t)d[0];
+    uint8_t st = d[H64_STORETYPE];
+    uint8_t ndim = d[H64_NDIM];
+    uint16_t kid = rd16(d + H64_KIND);
+    const char *kn = h64_kind_name(kid);
+    h->headlen = KVLANG_XVALUE_HEADLEN;
+    h->ref = (uint8_t)(ref < 0 ? 2 : ref);
+    h->storetype = st;
+    h->ro = d[2] & 1;
+    h->vid = rd32(d + H64_VID);
+    h->body_len = (int32_t)rd64(d + H64_BODYLEN);
+    h->body_offset = KVLANG_XVALUE_HEADLEN;
+    h->ndim = ndim;
+    for (int i = 0; i < ndim && i < X_MAX_NDIM; i++)
+        h->dims[i] = (int32_t)rd32(d + H64_DIMS + i * 4);
+    int o = 0;
+    if (st == H64_ST_ARRAY && ndim > 0) {
+        h->langtype[o++] = '[';
+        for (int i = 0; i < ndim && o < 200; i++) {
+            if (i)
+                h->langtype[o++] = ',';
+            o += snprintf((char *)h->langtype + o, sizeof h->langtype - (size_t)o, "%u",
+                          (unsigned)h->dims[i]);
+        }
+        h->langtype[o++] = ']';
+    }
+    size_t kl = strlen(kn);
+    if (o + (int)kl >= (int)sizeof h->langtype)
+        kl = sizeof h->langtype - (size_t)o - 1;
+    memcpy(h->langtype + o, kn, kl);
+    h->langtype[o + (int)kl] = 0;
+    h->langtype_len = o + (int32_t)kl;
+    return 0;
+}
+
+int kvlangXvalueEncodeBox(const char *kind, const uint8_t *raw, uint32_t raw_len,
+                          const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
+    if (!out || !out_len)
+        return -1;
+    if (ndim < 0)
+        ndim = 0;
+    if (ndim > X_MAX_NDIM)
+        return -1;
+    if (!kind)
+        kind = "";
+    uint32_t total = (uint32_t)KVLANG_XVALUE_HEADLEN + raw_len;
+    uint8_t *buf = malloc(total ? total : 1);
+    if (!buf)
+        return -1;
+    memset(buf, 0, KVLANG_XVALUE_HEADLEN);
+    buf[0] = 0;
+    buf[H64_STORETYPE] = h64_storetype(kind, ndim);
+    buf[H64_NDIM] = (uint8_t)ndim;
+    wr64(buf + H64_BODYLEN, raw_len);
+    wr64(buf + H64_BODYCAP, raw_len);
+    wr16(buf + H64_KIND, h64_kind_id(kind));
+    for (int i = 0; i < ndim; i++)
+        wr32(buf + H64_DIMS + i * 4, (uint32_t)(dims ? dims[i] : 0));
+    if (raw_len && raw)
+        memcpy(buf + KVLANG_XVALUE_HEADLEN, raw, raw_len);
+    *out = buf;
+    *out_len = total;
+    return 0;
+}
+
+
 void kvlangXvalueFree(kvlangXvalue_t *v) {
     if (!v->borrowed)
         free(v->data);
@@ -82,6 +226,8 @@ static int kvlangXvalueDecodeHeadRaw(const uint8_t *d, uint32_t len,
     memset(h, 0, sizeof(*h));
     if (!d || len == 0)
         return -1;
+    if (looks_head64(d, len))
+        return decode_head64(d, len, h);
     kvspaceDecodeHead(d, len, h);
     return h->langtype[0] ? 0 : -1;
 }
@@ -119,6 +265,12 @@ static uint8_t *kvlangXvalueEncodeTlv(const char *kind, const uint8_t *raw,
     int32_t ndim = al_to_dims(kind, array_len, dims);
     uint8_t *tmp = NULL;
     uint32_t tl = 0;
+    uint8_t *box = NULL;
+    uint32_t blen = 0;
+    if (kvlangXvalueEncodeBox(kind, raw, raw_len, dims, ndim, &box, &blen) == 0) {
+        *out_len = blen;
+        return box;
+    }
     if (kvspaceTlvEncode(kind, raw, raw_len, dims, ndim, &tmp, &tl) != 0) {
         *out_len = 0;
         return NULL;

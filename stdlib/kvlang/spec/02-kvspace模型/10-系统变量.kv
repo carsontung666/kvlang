@@ -51,9 +51,10 @@ runtime 按 `‥wdst` 把 `[0,+k]` **复制回**目标。地址写参（声明�
 
 ## `debugger()`
 
-`debugger()` 内建对齐 V8/TypeScript 的 `debugger;` 语句：源码内联暂停点。非调试模式下为 no-op；调试
-模式下将 `‥status` 置 `paused`，由外部驱动改回 `running` 恢复执行——**暂停能力就是 `‥status=paused`**
-（`debugger()` ≡ `vthread·setstatus("paused")`），**不会另设** `‥debugger` 之类的独立系统变量。
+`debugger()` 内建对齐 V8/TypeScript 的 `debugger;` 语句：源码内联暂停点。runtime **不存在**调试模式与
+非调试模式之分——`debugger()` **恒**将 `‥status` 置 `paused`，由外部驱动改回 `running` 恢复执行——**暂停
+能力就是 `‥status=paused`**（`debugger()` ≡ `vthread·setstatus("paused")`），**不会另设** `‥debugger`
+之类的独立系统变量。
 
 ## 域与变量之别
 

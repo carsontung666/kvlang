@@ -17,15 +17,3 @@ Frozen **before** v0.3 A-line work. Later numbers must use the same commands on 
 N=1e6 smoke: rust 1.907 / python 47.079 / kvspace 172.857 ns/iter.
 
 Issue #204 quoted 695.8 ns/iter on another machine and older shm; that figure is **not** this baseline.
-
-## prime_sieve(200) `python3 tutorial/test.py --no-build --bench --kvspace shm://…`
-
-| impl | ms |
-|------|----|
-| kvlang `bin/kvlang` | **6178.832** |
-| Python | 0.150 |
-| C `-O3` | 0.034 |
-
-kvlang / Python ≈ 41200×. Issue #194 quoted 33.37 s kvlang on another machine; that figure is **not** this baseline.
-
-PC remains a kvspace path (`·pc`); this freeze does not add a process-private PC.

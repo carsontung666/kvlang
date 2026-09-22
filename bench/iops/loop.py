@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""#204 floor: native while a=a+1. IOPS_N default 1e6 (CI); 1e8 for the issue number."""
 import os
 import time
 

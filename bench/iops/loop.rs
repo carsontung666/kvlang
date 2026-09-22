@@ -1,4 +1,3 @@
-// #204 floor: rustc -O while black_box(a) < black_box(n) { a = black_box(a)+1 }
 use std::hint::black_box;
 use std::time::Instant;
 

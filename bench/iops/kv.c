@@ -1,6 +1,4 @@
-/* #204 floor: shm Get+decode / +1 / NewInt64+Set. Same loop as kvlang a=a+1.
- * v0.2.18 无 kvspaceSet / kvspaceBytesFree：Get 是借用（不得 free）；Set 等价于
- * DecodeHead 后 WriteInPlace，失败再 WriteNewPlace，把 NewInt64 的 body 拷进去。 */
+/* v0.2.18：无 kvspaceSet。Get 借用，不得 free。WriteInPlace 失败再 WriteNewPlace。 */
 #include "kvspace/kvspace.h"
 #include <inttypes.h>
 #include <stdint.h>
@@ -23,22 +21,21 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* NewInt64 产出的完整 TLV → 后端。codec 缓冲由调用方 free。 */
+/* codec 缓冲由调用方 free。 */
 static int set_tlv(void *h, const char *key, uint8_t *tlv, uint32_t tlen,
                    char *err, uint32_t err_cap) {
     kvspaceHead_t hd;
     uint8_t *dst = NULL;
-    uint32_t body_len;
-    if (kvspaceDecodeHead(tlv, tlen, &hd) != 0)
+    if (kvspaceDecodeHead(tlv, tlen, &hd) != 0 || hd.body_len != 8)
         return 1;
-    body_len = hd.body_len < 0 ? 0 : (uint32_t)hd.body_len;
-    if (kvspaceWriteInPlace(h, key, 0, body_len, &dst, err, err_cap) != 0) {
+    if (kvspaceWriteInPlace(h, key, 0, 8, &dst, err, err_cap) != 0) {
         if (kvspaceWriteNewPlace(h, key, hd.ref, hd.storetype, hd.ro, hd.vid,
-                                 hd.langtype, body_len, &dst, err, err_cap) != 0)
+                                 hd.langtype, 8, &dst, err, err_cap) != 0)
             return 1;
     }
-    if (body_len && dst)
-        memcpy(dst, tlv + hd.body_offset, body_len);
+    if (!dst)
+        return 1;
+    memcpy(dst, tlv + hd.body_offset, 8);
     return 0;
 }
 

@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# IOPS floor (#204): Rust / Python / kvspace Get+Set, same a=a+1 loop.
-#   IOPS_N=1000000 ./bench/iops/run.sh          # default (CI-sized)
-#   IOPS_N=100000000 ./bench/iops/run.sh        # issue-sized (slow)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -z "${DEPS:-}" ]]; then
-  if [[ -d "$ROOT/.prefix" ]]; then
-    DEPS="$ROOT/.prefix"
-  else
-    DEPS="$ROOT/.deps"
-  fi
+  DEPS="$ROOT/.prefix"
+fi
+if ! grep -q 'kvspaceWriteInPlace' "$DEPS/include/kvspace/kvspace.h" 2>/dev/null; then
+  echo "missing kvspaceWriteInPlace in $DEPS/include/kvspace/kvspace.h (set DEPS)" >&2
+  exit 1
 fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/.run"

@@ -1,0 +1,14 @@
+// kvspace·cpdir：拷贝 key 子树，改 src 子节点不影响 dst
+// 期望输出:
+//   child: 1
+//   after: 1
+
+rwfunc test() -> () {
+	kvspace·set("/cptree/a", 1)
+	kvspace·cpdir("/cptree", "/cptree2")
+	v = kvspace·get("/cptree2/a")
+	println("child:", v)
+	kvspace·set("/cptree/a", 9)
+	v2 = kvspace·get("/cptree2/a")
+	println("after:", v2)
+}

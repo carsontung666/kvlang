@@ -22,7 +22,7 @@ static void pack_typed_array(const char *kind, const kvlangXvalue_t *elems,
     free(raw);
 }
 
-static int separated_len(kvlangKv_t *kv, const char *base) {
+int kvlangBuiltinCoordLen(kvlangKv_t *kv, const char *base) {
     for (int i = 0;; i++) {
         kvlangStrbuf_t k;
         kvlangStrbufInit(&k);
@@ -285,7 +285,7 @@ int kvlangBuiltinAppend(kvlangFrame_t *f) {
     char *base =
         kvlangBuiltinResolveWriteSlot(f->kv, fr, f->inst->writes[0].name);
     ensure_scattered(f, base);
-    int len = separated_len(f->kv, base);
+    int len = kvlangBuiltinCoordLen(f->kv, base);
     int64_t c[1] = {len};
     char *k = kvlangBuiltinScatterKey(base, c, 1);
     kvlangKvPair_t p = {k, n >= 2 ? in[1] : in[0]};
@@ -312,7 +312,7 @@ int kvlangBuiltinSlice(kvlangFrame_t *f) {
     char *base =
         kvlangBuiltinResolveWriteSlot(f->kv, fr, f->inst->writes[0].name);
     ensure_scattered(f, base);
-    int al = separated_len(f->kv, base);
+    int al = kvlangBuiltinCoordLen(f->kv, base);
     int lo = (int)kvlangScalarI64(kvlangXvalueScalar(&in[1])),
         hi = (int)kvlangScalarI64(kvlangXvalueScalar(&in[2]));
     if (lo < 0 || hi < lo || hi > al) {

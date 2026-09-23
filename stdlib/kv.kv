@@ -74,6 +74,20 @@ lib kvspace {
 				}
 			}
 			if (!skip) {
+				// shm 的 list 给出目录段时不带尾斜杠（redis 带）。
+				// 名下有 `<名>/` 子项时，收成 `名/`，调用方拿到的目录拼写一致。
+				string·len(m) -> ml2
+				if (ml2 > 0) {
+					string·char(m, ml2 - 1) -> tail2
+					if (tail2 != "/" && tail2 != "·") {
+						path + m -> pm
+						pm + "/" -> dslash
+						kvspace·listlen(dslash) -> dc
+						if (dc > 0) {
+							m + "/" -> m
+						}
+					}
+				}
 				array·append(names, m) -> names
 				n = n + 1
 			}

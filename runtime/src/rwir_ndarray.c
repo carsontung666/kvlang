@@ -26,6 +26,16 @@ int kvlangBuiltinNdarrayNumel(kvlangFrame_t *f) {
         kvlangLangtype kx;
         kvlangLangtypeParse(h.langtype, &kx);
         n_el = kx.array_len;
+    } else if (f->inst->nr > 0) {
+        /* array·slice/append 先散 key 再删 compact 头。stringkeymap 的元素总数是
+         * base·[i] 的成员数（spec 13），头已经不在。 */
+        char *fr = kvlangKeytreeFrameRoot(f->pc);
+        char *key = kvlangBuiltinResolveReadKey(
+            f->kv, fr, f->inst->reads[0].name, &f->inst->reads[0].val);
+        if (key)
+            n_el = kvlangBuiltinCoordLen(f->kv, key);
+        free(key);
+        free(fr);
     }
     kvlangXvalue_t r;
     kvlangXvalueNewInt64(&r, n_el);

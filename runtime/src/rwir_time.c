@@ -70,7 +70,9 @@ int kvlangBuiltinDurArith(kvlangFrame_t *f) {
     kvlangXvalue_t in[2]; int n = kvlangBuiltinReadInputs(f, in, 2);
     if (n < 2) { kvlangBuiltinFreeInputs(in, n); return kvlangBuiltinSetErr(f, "TypeError: time/duration arith requires 2 duration args"); }
     int64_t a = kvlangScalarI64(kvlangXvalueScalar(&in[0])), b = kvlangScalarI64(kvlangXvalueScalar(&in[1]));
-    bool sub = strstr(f->inst->opcode, ".sub") != NULL;
+    /* opcode 是 time/duration·sub（U+00B7）。旧的 ASCII ".sub" 一并认。 */
+    bool sub = strstr(f->inst->opcode, MEMBER_SEP "sub") != NULL ||
+               strstr(f->inst->opcode, ".sub") != NULL;
     kvlangXvalue_t e; new_duration(&e, sub ? a - b : a + b);
     int rc = kvlangBuiltinWriteResult(f, &e); kvlangXvalueFree(&e); kvlangBuiltinFreeInputs(in, n);
     return rc;

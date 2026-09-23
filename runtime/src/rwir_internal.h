@@ -11,6 +11,8 @@ int kvlangBuiltinSetErr(kvlangFrame_t *f, const char *fmt, ...);
 void kvlangBuiltinXvalueAt(const kvlangXvalue_t *v, int i, kvlangXvalue_t *out);
 char *kvlangBuiltinScatterKey(const char *base, const int64_t *coords,
                               int ncoord);
+/* 散 key 数组长度：连续的 base·[0]..base·[n-1]，遇 None 停止。 */
+int kvlangBuiltinCoordLen(kvlangKv_t *kv, const char *base);
 void kvlangBuiltinMemindex(kvlangXvalue_t *out, const char *const *names,
                            int n);
 void kvlangBuiltinMapMarker(kvlangXvalue_t *out, const char *langtype,

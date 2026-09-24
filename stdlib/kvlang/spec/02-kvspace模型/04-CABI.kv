@@ -38,6 +38,14 @@ camelCase）——kvspace 层前缀 `kvspace`（`kvspaceGet` / `kvspaceWriteInPl
 `kvspaceDelTree` 对**最终组件**不解析 link——写/删 Ptr 键只作用该键本体，不重定向到 target
 （`Del`/`DelTree` 为 POSIX rm 式：删指针本身，不删被指向者）。解引用由 runtime 显式 `*` 掌控（见
 [[ptr]]）。否则「写实参地址 Ptr 到帧槽」会被重定向到 target，导致丢参 / 写坏被指向的值。
+
+**写侧落盘时机（normative）**：`kvspaceWriteInPlace` / `kvspaceWriteNewPlace` 返回 body 偏移指针
+给调用方**在返回后**填，故本笔写不可能在返回前落盘——写在下一次 `kvspace*` 调用（读也算：每个 op
+开头先落盘上一笔）或 `kvspaceClose` 时落盘；前者失败以返回码 + err 报出，后者失败写 stderr。
+进程正常退出（`exit` / main 返回）时，前端（dispatch）对所有未 `Close` 句柄兜底关闭即落盘：
+**漏调 Close 不丢数据，真丢也绝不静默**。shm 后端写即落盘（body 指针即最终位置），两后端在
+「下一次调用前可见」上一致。
+
 ## kvspace C ABI 导出符号（快照）
 
 权威来源是**构建产物**——`nm -D --defined-only /usr/lib/kvspace/libkvspace.so | grep '^kvspace'`（前端

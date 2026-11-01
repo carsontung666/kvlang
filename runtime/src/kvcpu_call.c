@@ -622,13 +622,8 @@ static int handle_call_buf(kvspace_t *kv, const char *pc,
     }
 
     kvlangParkedFrame_t *pf = NULL;
-    bool can_park = cursor != NULL && callee_d > 1 &&
-                    callee_d <= MAX_STACK_DEPTH &&
-                    nr <= KVLANG_PARK_MAX_PARAMS &&
-                    nw <= KVLANG_PARK_MAX_PARAMS &&
-                    strlen(vtid) < sizeof pf->vtid &&
-                    strlen(func_key) < sizeof pf->func_key &&
-                    strlen(func_dir) < sizeof pf->func_dir;
+    /* Do not reuse frames across calls so Return deletes each callee frame immediately. */
+    bool can_park = false;
     bool warm_hit = false;
     if (can_park) {
         pf = &parked_frames[callee_d];

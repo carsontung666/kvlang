@@ -233,6 +233,10 @@ switch_frame_ctx(kvspace_t *kv, const char *vtid, const char *cur,
                  kvlangFrameCtx_t **fctx, kvlangFrameCtx_t **pool) {
     static __thread uint32_t lru_clock;
     kvlangParkedFrame_t *pf = kvlangParkedFrameGet(kv, vtid, depth);
+    if (depth < last_depth) {
+        for (int d = depth + 1; d <= last_depth && d <= MAX_STACK_DEPTH; d++)
+            fctx[d] = NULL;
+    }
     if (depth <= last_depth && fctx[depth] &&
         strcmp(fctx[depth]->frame_root, cur_frame) == 0) {
         fctx[depth]->park = pf;

@@ -670,9 +670,10 @@ static void bind_jump_targets(kvlangCodeRow_t *row, kvlangRowBind_t *b) {
 }
 
 static void bind_free(kvlangRowBind_t *b) {
-    if (b->body)
+    if (b->body) {
         kvlangBodySlotRelease(b->body);
         free(b->body);
+    }
     for (int i = 0; i < b->n; i++) {
         if (b->cell[i].view_state == 2) {
             kvlangReadViewSlotFree((kvlangReadViewSlot *)b->cell[i].off.fast);
@@ -954,6 +955,25 @@ kvlangRowBindDynWrites(kvspace_t *kv, const char *frame_root,
     return 0;
 }
 
+static void cell_demote_views(kvlangBoundCell_t *cell,
+                              kvlangBodySlot *row_body) {
+    rcell_invalidate(cell);
+    if (cell->view_state == 2) {
+        kvlangReadViewSlotFree((kvlangReadViewSlot *)cell->off.fast);
+        cell->off.fast = NULL;
+        cell->view.hits = 0;
+        cell->view_state = 1;
+    } else {
+        kvlangBodySlot *rs = cell->off.fast;
+        if (rs && rs != row_body) {
+            if (rs->reg)
+                body_unlink(rs);
+            free(rs);
+            cell->off.fast = NULL;
+        }
+    }
+}
+
 __attribute__((noinline)) int
 kvlangRowBindReenter(kvspace_t *kv, kvlangFrameCtx_t *ctx,
                      kvlangCodeRow_t *row, kvlangRowBind_t *b) {
@@ -995,17 +1015,12 @@ kvlangRowBindReenter(kvspace_t *kv, kvlangFrameCtx_t *ctx,
                 char *nk = owned_nk ? owned_nk : strdup(target_k);
                 if (!nk)
                     return -1;
-                rcell_invalidate(cell);
-                kvlangBodySlot *rs = cell->off.fast;
-                if (rs && rs != b->body && rs->reg)
-                    body_unlink(rs);
-                if (b->body && b->body->key == cell->key && b->body->reg)
+                cell_demote_views(cell, b->body);
+                if (b->body && j == row->nr && b->body->reg)
                     body_unlink(b->body);
                 free(cell->key);
                 cell->key = nk;
                 cell->off.key = nk;
-                if (rs && rs != b->body)
-                    rs->key = nk;
                 if (b->body && j == row->nr)
                     b->body->key = nk;
                 has_star = true;
@@ -1016,13 +1031,21 @@ kvlangRowBindReenter(kvspace_t *kv, kvlangFrameCtx_t *ctx,
                     0;
             } else {
                 free(owned_nk);
-                if (!fast_nk || !cell->off.resolved)
+                if (!fast_nk) {
+                    cell_demote_views(cell, b->body);
                     cell->off.resolved =
                         kvspaceResolveRef(kv->handle, cell->key,
                                           &cell->off.off) == 0;
+                    if (j >= row->nr)
+                        write_changed = true;
+                } else if (!cell->off.resolved) {
+                    cell->off.resolved =
+                        kvspaceResolveRef(kv->handle, cell->key,
+                                          &cell->off.off) == 0;
+                }
             }
         } else if (!pf) {
-            rcell_invalidate(cell);
+            cell_demote_views(cell, b->body);
             cell->off.resolved =
                 kvspaceResolveRef(kv->handle, cell->key, &cell->off.off) == 0;
             if (j >= row->nr)
@@ -1031,6 +1054,8 @@ kvlangRowBindReenter(kvspace_t *kv, kvlangFrameCtx_t *ctx,
     }
     if (b->body && (write_changed || !pf)) {
         b->body->ok = false;
+        b->body->head = NULL;
+        b->body->headlen = 0;
         b->body->body = NULL;
         b->body->dead = false;
     }

@@ -188,10 +188,17 @@ fn analyze_func(
     let mut src = func.clone();
     lower::annotate_call_returns(&mut src, sigs);
     let mut fn_ = lower::lower_func(&src)?;
+    let orig_tm = lower::infer_types(&fn_);
+    let orig_decl = lower::declared_types(&fn_);
+    let orig_sets = lower::infer_type_sets(&fn_);
+    let orig_stable = lower::stable_kinds(&fn_, &orig_tm, &orig_decl);
+    let mut diags = lower::validate_writes(&fn_, &orig_tm, structs, sigs);
+    let mut a0 = A0State::new(&fn_.body, &orig_tm, &orig_decl, &orig_sets, &orig_stable, structs);
+    dealias_rmw(&mut fn_.body, &mut a0);
+    lower::annotate_call_returns(&mut fn_, sigs);
     let type_map = lower::infer_types(&fn_);
     let declared = lower::declared_types(&fn_);
     let type_sets = lower::infer_type_sets(&fn_);
-    let mut diags = lower::validate_writes(&fn_, &type_map, structs, sigs);
     diags.extend(lower::specialize(&mut fn_, &type_map, &declared, &type_sets));
     for d in &diags {
         eprintln!("{}", d.string());
@@ -222,6 +229,310 @@ fn analyze_func(
         seq,
         labels,
     })
+}
+
+fn a0_slot_index(s: &str) -> usize {
+    s.strip_prefix("_a0_")
+        .and_then(|r| r.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn max_a0_index(body: &[Stmt]) -> usize {
+    let mut max_n = 0usize;
+    for st in body {
+        match st {
+            Stmt::Scope(s) => max_n = max_n.max(max_a0_index(&s.body)),
+            Stmt::Instruction(inst) => {
+                if let Some(e) = &inst.expr {
+                    let mut reads = HashSet::new();
+                    collect_expr_read_slots(e, &mut reads);
+                    for r in reads {
+                        max_n = max_n.max(a0_slot_index(&r));
+                    }
+                }
+                for w in &inst.writes {
+                    max_n = max_n.max(a0_slot_index(w));
+                }
+            }
+            _ => {}
+        }
+    }
+    max_n
+}
+
+fn collect_expr_read_slots(e: &super::ast::Expr, out: &mut HashSet<String>) {
+    if e.is_leaf() {
+        if e.quote == 0 && e.lit == super::ast::LitKind::LitNone && !e.val.is_empty() {
+            out.insert(e.val.clone());
+            let stripped = e.val.trim_start_matches('*');
+            if stripped != e.val {
+                out.insert(stripped.to_string());
+            }
+            if let Some(base) = stripped.split(keytree::MEMBER_SEP).next() {
+                if !base.is_empty() {
+                    out.insert(base.to_string());
+                }
+            }
+        }
+        return;
+    }
+    for a in &e.args {
+        collect_expr_read_slots(a, out);
+    }
+}
+
+fn write_aliases_reads(w: &str, reads: &HashSet<String>) -> bool {
+    if reads.contains(w) {
+        return true;
+    }
+    let stripped = w.trim_start_matches('*');
+    if reads.contains(stripped) {
+        return true;
+    }
+    if let Some(base) = stripped.split(keytree::MEMBER_SEP).next() {
+        if !base.is_empty() && reads.contains(base) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_write_addr_reads(w: &str, out: &mut HashSet<String>) {
+    if w.starts_with('*') && !w.starts_with("*[0,") {
+        let base = w
+            .trim_start_matches('*')
+            .split(keytree::MEMBER_SEP)
+            .next()
+            .unwrap_or("");
+        if !base.is_empty() {
+            out.insert(base.to_string());
+        }
+    }
+    for seg in w.split(keytree::MEMBER_SEP).skip(1) {
+        if let Some(dyn_k) = seg.strip_prefix('*') {
+            if !dyn_k.is_empty() {
+                out.insert(dyn_k.to_string());
+            }
+        }
+    }
+}
+
+fn reads_for_write(base_reads: &HashSet<String>, writes: &[String], j: usize) -> HashSet<String> {
+    let mut r = base_reads.clone();
+    if writes.len() > 1 {
+        for (j2, w2) in writes.iter().enumerate() {
+            if j2 != j {
+                collect_write_addr_reads(w2, &mut r);
+            }
+        }
+    }
+    r
+}
+
+fn is_subtree_op(op: &str) -> bool {
+    matches!(
+        op,
+        "obj"
+            | "map·new"
+            | "struct·new"
+            | "scatterarray·new"
+            | "scatterarray·newscatter"
+            | "scatterarray·append"
+            | "scatterarray·set"
+            | "scatterarray·slice"
+    )
+}
+
+fn slot_is_subtree(
+    inst: &Instruction,
+    j: usize,
+    w: &str,
+    declared: &HashMap<String, String>,
+    structs: &lower::StructTable,
+) -> bool {
+    let ty = inst
+        .write_types
+        .get(j)
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .or_else(|| lower::resolve_slot_type(w, declared, structs, declared))
+        .or_else(|| declared.get(w).cloned())
+        .unwrap_or_default();
+    if ty.is_empty() || ty.starts_with('*') {
+        return false;
+    }
+    ty.contains(keytree::MEMBER_SEP)
+        || ty.starts_with("/lib/")
+        || structs.contains_key(ty.as_str())
+}
+
+struct A0State<'a> {
+    tm: &'a HashMap<String, String>,
+    sets_tm: HashMap<String, String>,
+    declared: &'a HashMap<String, String>,
+    stable: &'a HashMap<String, String>,
+    structs: &'a lower::StructTable,
+    seen_written: HashSet<String>,
+    pool: HashMap<(String, String, Option<String>, String, usize), String>,
+    counter: usize,
+}
+
+impl<'a> A0State<'a> {
+    fn new(
+        body: &[Stmt],
+        tm: &'a HashMap<String, String>,
+        declared: &'a HashMap<String, String>,
+        sets: &HashMap<String, Vec<String>>,
+        stable: &'a HashMap<String, String>,
+        structs: &'a lower::StructTable,
+    ) -> Self {
+        let sets_tm: HashMap<String, String> = sets
+            .keys()
+            .filter_map(|k| lower::type_set_slot_type(sets, k).map(|t| (k.clone(), t)))
+            .collect();
+        let seen_written: HashSet<String> = declared.keys().cloned().collect();
+        Self {
+            tm,
+            sets_tm,
+            declared,
+            stable,
+            structs,
+            seen_written,
+            pool: HashMap::new(),
+            counter: max_a0_index(body),
+        }
+    }
+
+    fn note_writes(&mut self, writes: &[String]) {
+        for w in writes {
+            if self.sets_tm.contains_key(w) {
+                self.seen_written.insert(w.clone());
+            }
+        }
+    }
+}
+
+// Stage read-modify-write instructions through a frame-local temporary `_a0_k`
+// followed by `=`, keeping read and write sets disjoint per instruction.
+fn dealias_rmw(body: &mut Vec<Stmt>, st_a0: &mut A0State<'_>) {
+    let old = std::mem::take(body);
+    let mut out = Vec::with_capacity(old.len());
+    for st in old {
+        match st {
+            Stmt::Scope(mut s) => {
+                dealias_rmw(&mut s.body, st_a0);
+                out.push(Stmt::Scope(s));
+            }
+            Stmt::Instruction(inst) => {
+                let need_stage = match &inst.expr {
+                    Some(e) if !inst.writes.is_empty() => {
+                        if (e.is_leaf() && inst.writes.len() == 1 && inst.writes[0] == e.val)
+                            || is_subtree_op(&e.op)
+                        {
+                            false
+                        } else if e.op == "compactarray·set"
+                            && inst.writes.len() == 1
+                            && !e.args.is_empty()
+                            && e.args[0].is_leaf()
+                            && e.args[0].val == inst.writes[0]
+                        {
+                            let mut idx_val_reads = HashSet::new();
+                            for a in &e.args[1..] {
+                                collect_expr_read_slots(a, &mut idx_val_reads);
+                            }
+                            write_aliases_reads(&inst.writes[0], &idx_val_reads)
+                        } else {
+                            let mut reads = HashSet::new();
+                            collect_expr_read_slots(e, &mut reads);
+                            inst.writes.iter().enumerate().any(|(j, w)| {
+                                let w_reads = reads_for_write(&reads, &inst.writes, j);
+                                write_aliases_reads(w, &w_reads)
+                                    && !slot_is_subtree(
+                                        &inst,
+                                        j,
+                                        w,
+                                        st_a0.declared,
+                                        st_a0.structs,
+                                    )
+                            })
+                        }
+                    }
+                    _ => false,
+                };
+                if !need_stage {
+                    st_a0.note_writes(&inst.writes);
+                    out.push(Stmt::Instruction(inst));
+                    continue;
+                }
+                let (flat_op, _) = inst.flat();
+                let is_fill = inst
+                    .expr
+                    .as_ref()
+                    .is_some_and(|e| e.op == "compactarray·fill");
+                let mut main_inst = inst.clone();
+                let mut copies = Vec::new();
+                let mut reads = HashSet::new();
+                if let Some(e) = &inst.expr {
+                    collect_expr_read_slots(e, &mut reads);
+                }
+                for (j, w) in inst.writes.iter().enumerate() {
+                    let w_reads = reads_for_write(&reads, &inst.writes, j);
+                    if write_aliases_reads(w, &w_reads)
+                        && !slot_is_subtree(&inst, j, w, st_a0.declared, st_a0.structs)
+                    {
+                        let occ = inst.writes[..j].iter().filter(|x| *x == w).count();
+                        let main_wt = if is_fill || flat_op == "call" {
+                            inst.write_types.get(j).cloned().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let tmp = if let Some((ety, ek)) = lower::staged_write_pool_key(
+                            &inst,
+                            j,
+                            &main_wt,
+                            st_a0.tm,
+                            &st_a0.sets_tm,
+                            st_a0.declared,
+                            st_a0.stable,
+                            &st_a0.seen_written,
+                        ) {
+                            let key = (w.clone(), ety, ek, main_wt, occ);
+                            if let Some(existing) = st_a0.pool.get(&key) {
+                                existing.clone()
+                            } else {
+                                st_a0.counter += 1;
+                                let fresh = format!("_a0_{}", st_a0.counter);
+                                st_a0.pool.insert(key, fresh.clone());
+                                fresh
+                            }
+                        } else {
+                            st_a0.counter += 1;
+                            format!("_a0_{}", st_a0.counter)
+                        };
+                        main_inst.writes[j] = tmp.clone();
+                        if !is_fill && j < main_inst.write_types.len() {
+                            main_inst.write_types[j] = String::new();
+                        }
+                        let wtype = inst.write_types.get(j).cloned().unwrap_or_default();
+                        let has_wt = !wtype.is_empty();
+                        copies.push(Stmt::Instruction(Instruction {
+                            comments: Vec::new(),
+                            expr: Some(super::ast::leaf(&tmp)),
+                            writes: vec![w.clone()],
+                            write_types: if has_wt { vec![wtype] } else { Vec::new() },
+                            arrow_left: has_wt,
+                            operator: false,
+                        }));
+                    }
+                }
+                st_a0.note_writes(&inst.writes);
+                out.push(Stmt::Instruction(main_inst));
+                out.extend(copies);
+            }
+            other => out.push(other),
+        }
+    }
+    *body = out;
 }
 
 /// 待做 `[]` 下标校验的函数集合：显式 funcs + init_body/top_level_calls 合成的 init。
@@ -1872,5 +2183,54 @@ mod tests {
             &mut labels,
         );
         assert!(r.unwrap_err().contains("does not end with return/goto/br"));
+    }
+
+    #[test]
+    fn dealias_rmw_stages_scalar_and_preserves_subtree_ops() {
+        let mut kv = Kv::conn(&format!(
+            "fs:///dev/shm/kvlanglayout_a0_{}",
+            std::process::id()
+        ));
+        init_dirs(&mut kv).unwrap();
+        let src = "rwfunc bump(x:int64) -> (r:int64) {\n\
+                   \ty = x\n\
+                   \ty + 1 -> y\n\
+                   \ty + 2 -> y\n\
+                   \ta = [1, 2]\n\
+                   \ta[0] = 9\n\
+                   \tsa:[int64]·int64 = scatterarray·newscatter(a)\n\
+                   \tsa = scatterarray·append(sa, 3)\n\
+                   \ty -> r\n\
+                   }\n";
+        compile(&mut kv, src).unwrap();
+        assert_eq!(kvkind::rwir_sig(&kv.get_one("/lib/bump/[2,0]")), "int64·add");
+        assert_eq!(
+            kvkind::write_slot_name(&kv.get_one("/lib/bump/[2,1]")),
+            ("_a0_1".to_string(), "int64".to_string())
+        );
+        assert_eq!(kvkind::rwir_sig(&kv.get_one("/lib/bump/[3,0]")), "=");
+        assert_eq!(
+            kvkind::write_slot_name(&kv.get_one("/lib/bump/[3,-1]")),
+            ("_a0_1".to_string(), "int64".to_string())
+        );
+        assert_eq!(
+            kvkind::write_slot_name(&kv.get_one("/lib/bump/[3,1]")),
+            ("y".to_string(), "int64".to_string())
+        );
+        assert_eq!(kvkind::rwir_sig(&kv.get_one("/lib/bump/[4,0]")), "int64·add");
+        assert_eq!(
+            kvkind::write_slot_name(&kv.get_one("/lib/bump/[4,1]")),
+            ("_a0_1".to_string(), "int64".to_string())
+        );
+        assert_eq!(kvkind::rwir_sig(&kv.get_one("/lib/bump/[7,0]")), "compactarray·set");
+        assert_eq!(
+            kvkind::write_slot_name(&kv.get_one("/lib/bump/[7,1]")),
+            ("a".to_string(), "[2]int64".to_string())
+        );
+        assert_eq!(kvkind::rwir_sig(&kv.get_one("/lib/bump/[9,0]")), "scatterarray·append");
+        assert_eq!(
+            kvkind::write_slot_name(&kv.get_one("/lib/bump/[9,1]")),
+            ("sa".to_string(), "[int64]·int64".to_string())
+        );
     }
 }

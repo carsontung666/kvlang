@@ -62,7 +62,7 @@ run_case() {
 run_case callee_saved_7
 run_case register_pressure_9
 run_case read_before_write
-# guard 必须真正写 *err_out：JIT 报 runaway，而不是把 16M 次后的残值当成功结果。
-run_case guard_runaway "runaway loop (jit)" "runaway loop (fast)"
+# Guard must populate *err_out on runaway in both JIT and interpreter modes.
+run_case guard_runaway "runaway loop (jit)" "runaway loop"
 
 exit $fail

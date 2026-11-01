@@ -1252,6 +1252,51 @@ fn infer_inst(inst: &Instruction, tm: &mut HashMap<String, String>) {
     }
 }
 
+pub fn staged_write_pool_key(
+    inst: &Instruction,
+    j: usize,
+    main_wt: &str,
+    tm: &HashMap<String, String>,
+    sets_tm: &HashMap<String, String>,
+    declared: &HashMap<String, String>,
+    stable: &HashMap<String, String>,
+    seen_written: &HashSet<String>,
+) -> Option<(String, Option<String>)> {
+    let e = inst.expr.as_ref()?;
+    let (op, reads) = inst.flat();
+    for r in &reads {
+        let base = r.split(keytree::MEMBER_SEP).next().unwrap_or(r);
+        if !base.is_empty()
+            && !base.starts_with('*')
+            && literal_slot_type(base).is_empty()
+            && (!seen_written.contains(base) || !sets_tm.contains_key(base))
+        {
+            return None;
+        }
+    }
+    let nullable = (symbol::lookup(&op).word == "assign" && reads.len() > 1)
+        || matches!(op.as_str(), "scatterarray·at" | "kvspace·get");
+    if nullable && main_wt.is_empty() {
+        return None;
+    }
+    let mut probe = inst.clone();
+    if j < probe.write_types.len() {
+        probe.write_types[j] = main_wt.to_string();
+    } else if !main_wt.is_empty() {
+        probe.write_types.resize(j + 1, String::new());
+        probe.write_types[j] = main_wt.to_string();
+    }
+    let mut tm_c = tm.clone();
+    let mut sets_c = sets_tm.clone();
+    let t1 = per_write_types(&probe, &mut tm_c).get(j).and_then(|x| x.clone())?;
+    let t2 = per_write_types(&probe, &mut sets_c).get(j).and_then(|x| x.clone())?;
+    if t1.is_empty() || t1 != t2 || t1.contains('|') {
+        return None;
+    }
+    let ek = exact_kind(e, declared, stable);
+    Some((t1, ek))
+}
+
 /// 变量的有限类型集合（union 用）：签名/源码声明的类型 + 每条写的类型并集。
 /// 用于给操作数槽补类型：单元素 → 具体类型；多元素 → `<t1>|<t2>|…`。
 pub fn infer_type_sets(fn_: &Func) -> HashMap<String, Vec<String>> {

@@ -20,6 +20,7 @@ cp "$TERM" "$PFX/bin/byteseek"
 cp -P "$REPO_LIB"/libkvspace.so* "$REPO_LIB/libkvlanglayout.so" "$PFX/lib/"
 cp -rP "$REPO_LIB/kvspace" "$PFX/lib/"
 cp "$LIB" "$PFX/lib/libkvlang_runtimec2.so"
+ln -sf libkvlang_runtimec2.so "$PFX/lib/libkvlang_runtime.so"
 TERM="$PFX/bin/byteseek"
 # Prefer `KVSPACE_CLI` or repo `bin/kvspace` before falling back to `PATH`.
 KVCLI="${KVSPACE_CLI:-$ROOT/bin/kvspace}"

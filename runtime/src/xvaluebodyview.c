@@ -39,109 +39,16 @@ kvlangPcViewInit(kvlangPcViewState *st) {
     memset(st, 0, sizeof *st);
 }
 
-/* Acquire and validate `st->view` (v2 SLACK inline head with empty attr `[02 00]` for `‥pc`). */
-static bool pc_view_adopt(kvlangPcViewState *st, kvspace_t *kv,
-                          kvspaceKeyOff *ko) {
-    kvspaceXvalueBodyView_t nv;
-    if (kvspaceXvalueBodyView(kv->handle, &ko->off, ko->key, &nv) != 0)
-        return false;
-    if (!nv.head || nv.headlen != KVSPACE_XVALUE_HEAD_LEN ||
-        nv.body_cap < PC_FIXED_CAP ||
-        xh_storetype(nv.head) != KVSPACE_XVALUE_ST_SLACK ||
-        xh_ptr(nv.head) != KVSPACE_XVALUE_PTR_INLINE)
-        return false;
-    uint64_t a = xh_len(nv.head);
-    if (a + 2 > nv.body_cap || nv.body[a] != 2 || nv.body[a + 1] != 0)
-        return false;
-    st->view = nv;
-    return true;
-}
-
-/* 永久回退：同时作废 part-write 缓存（其可能指向被移动的旧 box）。 */
-static int pc_fallback(kvlangPcViewState *st) {
-    st->fallback = true;
-    kvlangPcCacheInvalidate();
-    return 0;
-}
-
-/* 首次：WriteNewPlace 一次预留 PC_FIXED_CAP 并写实际值（不得用 SetValue）。 */
-static bool pc_fixed_init(kvlangFrame_t *f, kvspaceKeyOff *ko, const char *pc,
-                          uint32_t len, kvlangPcViewState *st) {
-    if ((uint64_t)len + 2 > PC_FIXED_CAP)
-        return false;
-    uint8_t *body = NULL;
-    char err[256];
-    /* `‥pc` is untyped (empty attr `[02 00]`): reserve `PC_FIXED_CAP` to get `body_cap >= 1024`,
-     * then write the actual length and trailing `[02 00]` into the view. */
-    if (kvspaceWriteNewPlace(f->kvspace->handle, ko->key, KVSPACE_REF_INLINE,
-                             KVSPACE_STORETYPE_SLACK,
-                             PC_FIXED_CAP, PC_FIXED_CAP, "", &body, err,
-                             sizeof err) != 0 ||
-        !body)
-        return false;
-    kvlangPcCacheInvalidate(); /* box 可能被移动/重建 */
-    if (kvspaceResolveRef(f->kvspace->handle, ko->key, &ko->off) != 0)
-        return false;
-    ko->resolved = true;
-    kvspaceXvalueBodyView_t nv;
-    if (kvspaceXvalueBodyView(f->kvspace->handle, &ko->off, ko->key, &nv) != 0 ||
-        !nv.head || nv.headlen != KVSPACE_XVALUE_HEAD_LEN ||
-        nv.body_cap < PC_FIXED_CAP)
-        return false;
-    memcpy(nv.body, pc, len);
-    nv.body[len] = 2;
-    nv.body[len + 1] = 0;
-    kvspaceXvalueHead hd = {
-        .storetype = KVSPACE_XVALUE_ST_SLACK,
-        .ptr = KVSPACE_XVALUE_PTR_INLINE,
-    };
-    kvspaceXvalueHeadSetLen(&hd, len);
-    memcpy(nv.head, &hd, sizeof hd);
-    return pc_view_adopt(st, f->kvspace, ko);
-}
-
 __attribute__((visibility("hidden"))) int
 kvlangPcViewWrite(kvlangFrame_t *f, kvspaceKeyOff *ko, const char *pc,
                       uint32_t len) {
-    kvlangPcViewState *st = f->pc_view_state;
-    if (!st || st->fallback || !f->kvspace->shm)
-        return 0;
-    if (!st->ready) {
-        /* 已有固定档槽（如前一次运行）直接采用；否则首次建/扩。 */
-        if (ko->resolved && pc_view_adopt(st, f->kvspace, ko)) {
-            st->ready = true;
-        } else {
-            if (!pc_fixed_init(f, ko, pc, len, st))
-                return pc_fallback(st);
-            st->ready = true;
-            return 1; /* 本次值已由 WriteNewPlace 写入 */
-        }
-    }
-    if ((uint64_t)len + 2 > st->view.body_cap)
-        return pc_fallback(st);
-    if ((++st->recheck & 127u) == 0) {
-        /* 删除/重建检测：强制重解析 keyoff 再取 view。 */
-        if (kvspaceResolveRef(f->kvspace->handle, ko->key, &ko->off) != 0 ||
-            !pc_view_adopt(st, f->kvspace, ko))
-            return pc_fallback(st);
-    }
-    uint8_t *h = st->view.head;
-    uint64_t old_len = xh_len(h);
-    if (xh_storetype(h) != KVSPACE_XVALUE_ST_SLACK ||
-        xh_ptr(h) != KVSPACE_XVALUE_PTR_INLINE ||
-        old_len + 2 > st->view.body_cap ||
-        st->view.body[old_len] != 2 || st->view.body[old_len + 1] != 0)
-        return pc_fallback(st);
-    memcpy(st->view.body, pc, len);
-    st->view.body[len] = 2;
-    st->view.body[len + 1] = 0;
-    kvspaceXvalueHead hd = {
-        .storetype = KVSPACE_XVALUE_ST_SLACK,
-        .ptr = KVSPACE_XVALUE_PTR_INLINE,
-    };
-    kvspaceXvalueHeadSetLen(&hd, len);
-    memcpy(h, &hd, sizeof hd);
-    return 1;
+    (void)f;
+    (void)ko;
+    (void)pc;
+    (void)len;
+    /* General-path PC updates go through pc_write_whole so length/prefix
+     * changes swap via a fresh SBO box without mid-memcpy tearing. */
+    return 0;
 }
 
 /* ── T-120 A：lazy operand 只读 view ────────────────────────────────── */

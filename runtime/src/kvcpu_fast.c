@@ -243,32 +243,58 @@ static bool fk_pc_open(fk_pc_t *pc, kvspaceKeyOff *ko, const char *prefix,
     return true;
 }
 
-/* Rewrite PC tail `[irseq,0]` in place (returning false if capacity is insufficient)
- * and relocate the trailing empty attr `[02 00]` to `8 + new_len`. */
-static inline bool fk_pc_write(fk_pc_t *pc, int irseq) {
-    char tail[16];
-    size_t tl = fk_tail(tail, irseq);
+typedef uint64_t fk_u64_unaligned __attribute__((may_alias, aligned(1)));
+
+static inline bool fk_pc_can_atomic(const fk_pc_t *pc, size_t tl) {
     uint32_t len = pc->plen + (uint32_t)tl;
-    if ((uint64_t)len + 2 > pc->cap)
+    if (len != pc->cur_len || tl > 8 || (uint64_t)pc->plen + 8 > pc->cap)
         return false;
-    memcpy(pc->body + pc->plen, tail, tl);
-    if (len != pc->cur_len) {
-        pc->body[len] = 2;
-        pc->body[len + 1] = 0;
-        kvspaceXvalueHead h = {
-            .storetype = KVSPACE_XVALUE_ST_SLACK,
-            .ptr = KVSPACE_XVALUE_PTR_INLINE,
-        };
-        kvspaceXvalueHeadSetLen(&h, len);
-        memcpy(pc->head, &h, sizeof h);
-        pc->cur_len = len;
-    }
+    uintptr_t addr = (uintptr_t)(pc->body + pc->plen);
+    return (addr & 63u) <= 56u;
+}
+
+/* Rewrite same-length PC tail `[irseq,0]` in a single 64-bit store within one
+ * cache line; length transitions fall back to pc_write_whole CoW. */
+static inline bool fk_pc_write(fk_pc_t *pc, const char *tail, size_t tl) {
+    if (!fk_pc_can_atomic(pc, tl))
+        return false;
+    uint8_t *p = pc->body + pc->plen;
+    uint64_t word;
+    memcpy(&word, p, 8);
+    memcpy(&word, tail, tl);
+    *(volatile fk_u64_unaligned *)p = word;
     return true;
+}
+
+static inline void fk_write_scalar(uint8_t *dst, const uint8_t *val, uint32_t w) {
+    if (w == 1) {
+        __atomic_store_n(dst, val[0], __ATOMIC_RELAXED);
+    } else if (w == 2 && (((uintptr_t)dst & 1u) == 0)) {
+        uint16_t v;
+        memcpy(&v, val, 2);
+        __atomic_store_n((uint16_t *)dst, v, __ATOMIC_RELAXED);
+    } else if (w == 4 && (((uintptr_t)dst & 3u) == 0)) {
+        uint32_t v;
+        memcpy(&v, val, 4);
+        __atomic_store_n((uint32_t *)dst, v, __ATOMIC_RELAXED);
+    } else if (w == 8 && (((uintptr_t)dst & 7u) == 0)) {
+        uint64_t v;
+        memcpy(&v, val, 8);
+        __atomic_store_n((uint64_t *)dst, v, __ATOMIC_RELAXED);
+    } else {
+        memcpy(dst, val, w);
+    }
 }
 
 static inline bool fk_status_running(kvspaceKeyOff *ko) {
     if (!ko->view_ok)
         return false;
+    if (!ko->status_tok_ok ||
+        kvspaceViewCheck(ko->kvspace->handle, &ko->status_tok) != 0) {
+        ko->view_ok = false;
+        ko->status_tok_ok = false;
+        return false;
+    }
     const uint8_t *h = ko->view.head;
     return ko->view.headlen == KVSPACE_XVALUE_HEAD_LEN &&
            xh_storetype(h) == KVSPACE_XVALUE_ST_SLACK &&
@@ -412,6 +438,8 @@ int kvlangFastRun(kvlangFrameCtx_t *ctx, int *irseq_io, kvspaceKeyOff *pc_off,
     int steps = 0;
     kvlangCodeRow_t **rows = ctx->code->rows;
     for (;;) {
+        if (steps >= 4096)
+            break;
         if ((size_t)irseq >= ctx->code->rows_cap ||
             (size_t)irseq >= ctx->binds_cap)
             break;
@@ -438,12 +466,13 @@ int kvlangFastRun(kvlangFrameCtx_t *ctx, int *irseq_io, kvspaceKeyOff *pc_off,
         /* 先值后 PC：与通用路径（WriteBody → NextPc）的落盘顺序一致。
          * PC 容量不足时值也不写，整行交还通用路径。 */
         char tail[16];
-        if ((uint64_t)pc.plen + fk_tail(tail, next) + 2 > pc.cap)
+        size_t tl = fk_tail(tail, next);
+        if (!fk_pc_can_atomic(&pc, tl))
             break;
         if (w)
-            memcpy(dst, val, w);
-        if (!fk_pc_write(&pc, next))
-            break; /* 不可达：容量已预检 */
+            fk_write_scalar(dst, val, w);
+        if (!fk_pc_write(&pc, tail, tl))
+            break;
         irseq = next;
         steps++;
     }

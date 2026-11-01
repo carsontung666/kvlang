@@ -44,15 +44,6 @@ static bool value_to_buffer(kvlangXvalue_t *v, char *out, size_t cap) {
     return true;
 }
 
-/* 绑定：key 由调用方持有；只缓存 key 的 64 位地址，值仍每次读。 */
-void kvspaceKeyOffBind(kvspaceKeyOff *ko, kvspace_t *kvspace, const char *key) {
-    ko->kvspace = kvspace;
-    ko->key = key;
-    ko->fast = NULL;
-    ko->view_ok = false;
-    ko->resolved = kvspaceResolveRef(kvspace->handle, key, &ko->off) == 0;
-}
-
 static bool is_status_key(const char *key) {
     static const char pfx[] = "/vthread/";
     static const char suf[] = "/\xE2\x80\xA5status";
@@ -63,14 +54,52 @@ static bool is_status_key(const char *key) {
            memcmp(key + n - sl, suf, sl) == 0;
 }
 
+/* Bind cached 64-bit key offset; the caller retains ownership of key. */
+void kvspaceKeyOffBind(kvspaceKeyOff *ko, kvspace_t *kvspace, const char *key) {
+    ko->kvspace = kvspace;
+    ko->key = key;
+    ko->fast = NULL;
+    ko->view_ok = false;
+    ko->status_tok_ok = false;
+    ko->resolved = kvspaceResolveRef(kvspace->handle, key, &ko->off) == 0;
+    if (ko->resolved && kvspace->shm && kvspace->slot_view_sup >= 0) {
+        int vrc = kvspaceXvalueBodyView(kvspace->handle, &ko->off, key, &ko->view);
+        if (vrc == 0 && ko->view.headlen == KVSPACE_XVALUE_HEAD_LEN &&
+            KVSPACE_XVALUE_HEAD_LEN + ko->view.body_cap <= ko->view.cap) {
+            kvspace->slot_view_sup = 1;
+            ko->view_ok = true;
+            if (is_status_key(key) &&
+                kvspaceViewFromRef(kvspace->handle, &ko->off, key,
+                                   &ko->status_tok) == 0) {
+                ko->status_tok_ok = true;
+            }
+        } else if (vrc == -2) {
+            kvspace->slot_view_sup = -1;
+        }
+    }
+}
+
 bool kvspaceKeyOffRead(kvspaceKeyOff *ko, char *out, size_t cap) {
+    if (ko->view_ok && is_status_key(ko->key) &&
+        (!ko->status_tok_ok ||
+         kvspaceViewCheck(ko->kvspace->handle, &ko->status_tok) != 0)) {
+        ko->view_ok = false;
+        ko->status_tok_ok = false;
+    }
     if (!ko->view_ok && ko->resolved && ko->kvspace->shm &&
         ko->kvspace->slot_view_sup >= 0 && is_status_key(ko->key)) {
-        int vrc = kvspaceXvalueBodyView(ko->kvspace->handle, &ko->off, ko->key,
-                                  &ko->view);
+        ko->resolved =
+            kvspaceResolveRef(ko->kvspace->handle, ko->key, &ko->off) == 0;
+        int vrc = ko->resolved
+                      ? kvspaceXvalueBodyView(ko->kvspace->handle, &ko->off,
+                                              ko->key, &ko->view)
+                      : -1;
         if (vrc == 0) {
             ko->kvspace->slot_view_sup = 1;
             ko->view_ok = true;
+            ko->status_tok_ok =
+                kvspaceViewFromRef(ko->kvspace->handle, &ko->off, ko->key,
+                                   &ko->status_tok) == 0;
         } else if (vrc == -2) {
             ko->kvspace->slot_view_sup = -1;
         }
@@ -223,36 +252,11 @@ static int pc_write_whole(kvlangFrame_t *f, struct kvspaceKeyOff *ko,
 
 static int pc_write_part(kvlangFrame_t *f, struct kvspaceKeyOff *ko,
                          const char *s, uint32_t len) {
-    uint8_t *b = pc_cache.buf;
-    kvspaceXvalueHead hd = {
-        .storetype = KVSPACE_XVALUE_ST_SLACK,
-        .ptr = KVSPACE_XVALUE_PTR_INLINE,
-    };
-    kvspaceXvalueHeadSetLen(&hd, len);
-    memcpy(b, &hd, sizeof hd);
-    if (!ko->view_ok && ko->resolved)
-        capture_pc_view(f, ko);
-    if (ko->view_ok) {
-        uint8_t *vh = ko->view.head;
-        /* `‥pc` carries empty trailing attr `[02 00]` at `8 + len`; update head, body,
-         * and trailing `[02 00]` in place when `plen + 2 <= body_cap`. */
-        if (ko->view.headlen == KVSPACE_XVALUE_HEAD_LEN &&
-            xh_storetype(vh) == KVSPACE_XVALUE_ST_SLACK &&
-            xh_ptr(vh) == KVSPACE_XVALUE_PTR_INLINE) {
-            uint64_t old_len = xh_len(vh);
-            if (old_len + 2 <= ko->view.body_cap &&
-                (uint64_t)len + 2 <= ko->view.body_cap &&
-                ko->view.body[old_len] == 2 &&
-                ko->view.body[old_len + 1] == 0) {
-                memcpy(vh, b, KVSPACE_XVALUE_HEAD_LEN);
-                memcpy(ko->view.body, s, len);
-                ko->view.body[len] = 2;
-                ko->view.body[len + 1] = 0;
-                return 0;
-            }
-        }
-        ko->view_ok = false;
-    }
+    (void)f;
+    (void)ko;
+    (void)s;
+    (void)len;
+    /* General-path PC updates fall back to pc_write_whole for atomic CoW replacement. */
     return -1;
 }
 
@@ -267,6 +271,8 @@ static void member_write(kvlangFrame_t *f, struct kvspaceKeyOff *ko,
         uint32_t n = kvlangSlackCharToWire((const uint8_t *)s, len, cap, val,
                                            sizeof val);
         if (ko) {
+            ko->view_ok = false;
+            ko->status_tok_ok = false;
             if (kvspaceKeyOffSet(ko, val, n, NULL, 0) != 0)
                 f->persist_failed = true;
             return;

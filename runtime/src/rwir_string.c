@@ -39,30 +39,6 @@ static uint32_t *string_runes(const kvlangXvalue_t *v, int *out_n) {
 }
 
 static int write_char32(kvlangFrame_t *f, const uint32_t *r, int n) {
-    if (n == 1 && f->kvspace && f->kvspace->shm && f->instruction &&
-        f->instruction->write_count == 1 && f->instruction->write_offs) {
-        const char *target = f->instruction->writes[0].type;
-        if (!target || !target[0]) {
-            kvspaceKeyOff *wo = f->instruction->write_offs[0];
-            if (wo && wo->resolved) {
-                uint8_t *cur = NULL;
-                uint32_t cur_len = 0;
-                if (kvspaceGetByRef(f->kvspace->handle, &wo->off, wo->key, &cur,
-                                    &cur_len) == 0 &&
-                    cur && cur_len >= KVSPACE_XVALUE_HEAD_LEN + 4 &&
-                    xh_storetype(cur) == KVSPACE_XVALUE_ST_SLACK &&
-                    xh_ptr(cur) == KVSPACE_XVALUE_PTR_INLINE &&
-                    xh_len(cur) == 4) {
-                    cur[8] = (uint8_t)(r[0] & 0xFF);
-                    cur[9] = (uint8_t)((r[0] >> 8) & 0xFF);
-                    cur[10] = (uint8_t)((r[0] >> 16) & 0xFF);
-                    cur[11] = (uint8_t)((r[0] >> 24) & 0xFF);
-                    kvlangBuiltinNextPc(f);
-                    return 0;
-                }
-            }
-        }
-    }
     char lt[48];
     int ln = snprintf(lt, sizeof lt, "[%d]char/utf32", n);
     if (n >= 0 && n <= 16) {

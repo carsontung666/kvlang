@@ -401,9 +401,12 @@ __attribute__((aligned(64))) int kvlangKvcpuExecuteMode(kvspace_t *kv, const cha
         }
         const char *cur = have_fb ? fb_b[fb_i] : cur_b;
         have_fb = false;
-        /* Observe external status changes on every step. */
+        /* Observe external and self-issued status changes on every step. */
         bool have_status = false;
-        if (status_view_ok && ((++status_recheck & 127u) == 0)) {
+        if (status_view_ok &&
+            (!status_off.view_ok || !status_off.status_tok_ok ||
+             kvspaceViewCheck(kv->handle, &status_off.status_tok) != 0 ||
+             ((++status_recheck & 127u) == 0))) {
             /* 周期重验：删除 → 丢弃 view 并安全回退；重建 → 采用新地址。 */
             kvspaceKeyOffBind(&status_off, kv, status_off.key);
             kvspaceXvalueBodyView_t nv;

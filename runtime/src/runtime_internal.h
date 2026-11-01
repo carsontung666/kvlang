@@ -885,6 +885,8 @@ struct kvspaceKeyOff {
     bool resolved;
     kvspaceXvalueBodyView_t view; /* #513 快核：读视图缓存 */
     bool view_ok;
+    kvspaceViewToken_t status_tok;
+    bool status_tok_ok;
     /* 定长标量写槽（只写参、只候选行设置）：emit 快路径由此取绑定。 */
     void *fast;
 };

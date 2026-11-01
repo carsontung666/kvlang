@@ -630,7 +630,23 @@ kvlangBuiltinWriteBody(kvlangFrame_t *f, const char *kind, const uint8_t *raw,
 #ifdef KV_COUNT
         kvCBodyFast++;
 #endif
-        memcpy(slot->body, raw, len);
+        if (len == 1) {
+            __atomic_store_n(slot->body, raw[0], __ATOMIC_RELAXED);
+        } else if (len == 2 && (((uintptr_t)slot->body & 1u) == 0)) {
+            uint16_t v;
+            memcpy(&v, raw, 2);
+            __atomic_store_n((uint16_t *)slot->body, v, __ATOMIC_RELAXED);
+        } else if (len == 4 && (((uintptr_t)slot->body & 3u) == 0)) {
+            uint32_t v;
+            memcpy(&v, raw, 4);
+            __atomic_store_n((uint32_t *)slot->body, v, __ATOMIC_RELAXED);
+        } else if (len == 8 && (((uintptr_t)slot->body & 7u) == 0)) {
+            uint64_t v;
+            memcpy(&v, raw, 8);
+            __atomic_store_n((uint64_t *)slot->body, v, __ATOMIC_RELAXED);
+        } else {
+            memcpy(slot->body, raw, len);
+        }
         kvlangBuiltinNextPc(f);
         return 1;
     }
@@ -707,8 +723,32 @@ int kvlangBuiltinExecuteCopy(kvlangFrame_t *f) {
 #ifdef KV_COUNT
                     kvCBodyFast++;
 #endif
-                    memcpy(slot->body,
-                           rv->bytes + KVSPACE_XVALUE_HEAD_LEN, slot->width);
+                    if (slot->width == 1) {
+                        __atomic_store_n(slot->body,
+                                         rv->bytes[KVSPACE_XVALUE_HEAD_LEN],
+                                         __ATOMIC_RELAXED);
+                    } else if (slot->width == 2 &&
+                               (((uintptr_t)slot->body & 1u) == 0)) {
+                        uint16_t v;
+                        memcpy(&v, rv->bytes + KVSPACE_XVALUE_HEAD_LEN, 2);
+                        __atomic_store_n((uint16_t *)slot->body, v,
+                                         __ATOMIC_RELAXED);
+                    } else if (slot->width == 4 &&
+                               (((uintptr_t)slot->body & 3u) == 0)) {
+                        uint32_t v;
+                        memcpy(&v, rv->bytes + KVSPACE_XVALUE_HEAD_LEN, 4);
+                        __atomic_store_n((uint32_t *)slot->body, v,
+                                         __ATOMIC_RELAXED);
+                    } else if (slot->width == 8 &&
+                               (((uintptr_t)slot->body & 7u) == 0)) {
+                        uint64_t v;
+                        memcpy(&v, rv->bytes + KVSPACE_XVALUE_HEAD_LEN, 8);
+                        __atomic_store_n((uint64_t *)slot->body, v,
+                                         __ATOMIC_RELAXED);
+                    } else {
+                        memcpy(slot->body,
+                               rv->bytes + KVSPACE_XVALUE_HEAD_LEN, slot->width);
+                    }
                     kvlangBuiltinNextPc(f);
                     return 0;
                 }

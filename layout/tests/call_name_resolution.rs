@@ -83,14 +83,13 @@ fn global_wins_over_same_package_function() {
 
 #[test]
 fn unknown_bare_call_is_rejected() {
-    // 未实现的内建（如 debugger）：既不是全局函数、也未 def rwir 声明 → 明确报错，
-    // 不放行到运行期（运行期同样 unknown rwir，只会把失败推迟）。
+    // Reject undeclared bare calls at layout time rather than deferring to runtime.
     let mut kv = fresh_kv("unknown");
     let err = compile(
         &mut kv,
-        "rwfunc t() -> () {\n    debugger()\n}\n",
+        "rwfunc t() -> () {\n    unknown_fn()\n}\n",
     )
     .unwrap_err();
-    assert!(err.contains("未定义函数 debugger"), "{err}");
+    assert!(err.contains("未定义函数 unknown_fn"), "{err}");
     assert!(err.contains("未给出被调函数的完整路径"), "{err}");
 }

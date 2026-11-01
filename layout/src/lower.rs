@@ -571,6 +571,15 @@ fn lower_body(
     let mut preamble: Vec<Stmt> = Vec::new();
     for (i, st) in stmts.iter().enumerate() {
         match st {
+            Stmt::Instruction(s) if is_debugger_call(s) => {
+                // Expand `debugger()` to `vthread·setstatus("paused")` per spec.
+                let mut inst = s.clone();
+                inst.expr = Some(ast::call(
+                    "vthread·setstatus",
+                    vec![ast::str_lit("paused")],
+                ));
+                preamble.push(Stmt::Instruction(inst));
+            }
             Stmt::Instruction(s) => {
                 // 散 key 数组字面量 `base = {v0, v1, ...}` → 逐元素散 key 写入。
                 if s.writes.len() == 1 {
@@ -638,6 +647,14 @@ fn lower_body(
         }
     }
     preamble
+}
+
+fn is_debugger_call(s: &Instruction) -> bool {
+    s.writes.is_empty()
+        && s
+            .expr
+            .as_ref()
+            .is_some_and(|e| e.op == "debugger" && e.args.is_empty())
 }
 
 fn lower_if_with_cont(

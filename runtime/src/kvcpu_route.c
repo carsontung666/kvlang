@@ -91,6 +91,9 @@ __attribute__((visibility("hidden"))) int kvlangKvcpuRoute(kvlangFrame_t *f) {
         if (rc == KVLANG_DELEGATE_LOCAL)
             goto user_call;
         *f->addr_epoch += 1; /* 委托会删除输出槽 */
+        /* The delegate advances the PC from another process (CoW box replacement): drop the stale PC view. */
+        if (f->pc_off)
+            f->pc_off->view_ok = false;
         return rc;
     }
     if (row->is_def_rwir) {
@@ -112,6 +115,9 @@ __attribute__((visibility("hidden"))) int kvlangKvcpuRoute(kvlangFrame_t *f) {
         if (rc == 0)
             rc = kvlangHandoffExternalRwir(kv, vtid, cur, inst);
         *f->addr_epoch += 1; /* 外部执行器可能删除/重建 key */
+        /* The external executor advances the PC from another process (CoW box replacement): drop the stale PC view. */
+        if (f->pc_off)
+            f->pc_off->view_ok = false;
         return rc;
     }
 user_call:
